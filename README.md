@@ -46,12 +46,15 @@ docs/
 
 **1. PANEL 打开 OS 文件选择器闪一下就消失、之后再打不开**
 不是权限也不是缓存。`blocking_pick_*` 把 sheet 挂到「非激活 NSPanel + Accessory 应用」上，
-面板的失焦自动隐藏把 sheet 父窗口关掉，picker 立即 dismiss；收尾时 rfd 复位 activation
-policy / 重新 `makeKeyAndOrderFront` 又打乱了 AppKit 进程级 modal 状态，后续调用在同一坏条件下
-继续秒退。详见 [docs/host-file-picker.md](docs/host-file-picker.md)。
-**本插件完全不弹 OS picker**，所有选择走 SDK 的页面内文件树（不依赖宿主版本、Web 模式也能用）。
-宿主侧根因也已在 OTools 主仓 `2e5a03cd` 修复（对话框会话护栏 + 无 parent 命令优先），
+面板的失焦自动隐藏把 sheet 父窗口关掉，picker 立即 dismiss；而 `Panel::run_modal()` 在
+`beginSheetModalForWindow` 之后还无条件 `runModal()`，双重模态在父窗口被隐藏后留下不一致状态，
+后续调用在同一组条件下继续秒退。**注意**：旧结论里「rfd 复位 activation policy 打乱 AppKit
+模态状态」不严谨，已在文档中更正（rfd 对已是 Accessory 的应用不做任何策略提升）。
 详见 [docs/host-file-picker.md](docs/host-file-picker.md)。
+**本插件完全不弹 OS picker**，所有选择走 SDK 的页面内文件树（不依赖宿主版本、Web 模式也能用）。
+宿主侧已修复：PANEL 在原生对话框会话期间 hold 不隐藏（根本修复），并把三个
+`tools_webview_pick_*` 改为保留 parent 的非阻塞 **async sheet**（只 `beginSheet`、不 `runModal`）；
+「去掉 parent 绕开 sheet」的方案已撤回。详见 [docs/host-file-picker.md](docs/host-file-picker.md)。
 
 **2. 宿主是否支持插件拖拽**
 支持，但不是 HTML5 `dataTransfer.files`。wry 默认拦截 OS 原生 drop（所以 `File` 对象拿不到），

@@ -1,96 +1,131 @@
-# 为什么 PANEL 里打开 OS 原生文件选择器会「闪一下就没了」，之后再打不开
+# PANEL 里打开 OS 文件选择器「闪一下就没了」的根因与宿主修复
 
-> 结论先行：**不是权限问题，也不是选择器单例缓存**。是 `blocking` picker 把 sheet 挂到
-> 「非激活 NSPanel + Accessory 应用」上，而面板的「失焦自动隐藏」把 sheet 的父窗口关掉了；
-> 一次失败还会把 AppKit 的进程级 modal / 激活状态打乱，于是后续每次调用都在同一个坏条件下秒退。
+> 结论先行：**不是权限问题，也不是选择器单例缓存**。根因是 `otools-panel` 的
+> 「失焦自动隐藏」把 picker 这张 sheet 的父窗口关掉了。宿主侧的修复分两层：
 >
-> 以下路径均相对宿主仓库 `ootools/OTools`（Tauri 2.10 / tauri-runtime-wry 2.10 / rfd 0.16 / tauri-plugin-dialog 2.x）。
+> 1. **根本修复**：PANEL 在原生对话框会话期间 **hold 不隐藏**，会话结束后再恢复自动隐藏；
+> 2. **消除双重模态**：把宿主的三个 `tools_webview_pick_*` 从 `blocking_pick_*`
+>    改成非阻塞的 **async sheet**——只 `beginSheetModalForWindow`，不 `runModal()`，
+>    不阻塞主线程；**parent 保留**，sheet 的原生观感不变。
+>
+> 「把 picker 改成无 parent 的独立窗口」只是绕过症状，且会改变交互形态，**没有采用**。
+>
+> 以下路径均相对宿主仓库 `ootools/OTools`（Tauri 2.9 / tauri-plugin-dialog 2.6.0 / rfd 0.16.0）。
+> 行号会随版本漂移，以下按「文件 + 符号」定位。
 
-## 1. 所有的宿主 picker 都是 blocking，且带 parent
+## 1. 底层调用链（源码证据）
 
 | 位置 | 行为 |
 | --- | --- |
-| `crates/ot-platform-core/src/webview_fs/core.rs:376-395, 445-460, 490-499` | `app_handle.dialog().file().blocking_pick_files/pick_file/save_file/pick_folder()` |
-| `src-tauri/src/builtin_plugin_handlers.rs:61-65` | 把上面这些注册成 `tools_webview_pick_folder` / `pick_files` / `pick_save_path` |
-| `crates/ot-platform-core/src/webview_fs/transport.rs:9-41` | transport → service → core 的转发 |
-| `src-tauri/src/platform/webview/preload.js:808, 956` | `dialogApi.open` 的回退链 |
-| `src/platform/runtime/otools/index.ts:268-296, 325-331` | 先 `plugin:dialog\|open`，失败再回落宿主命令 |
-| `src-tauri/src/lib.rs:928` | 注册 tauri-plugin-dialog |
+| `tauri-plugin-dialog/src/commands.rs::open/save` | 命令虽是 `async fn`，内部仍调 `blocking_pick_file(s)` / `blocking_save_file`，并在 macOS/Windows 上 `set_parent(&window)` |
+| `tauri-plugin-dialog/src/lib.rs::FileDialogBuilder::blocking_pick_*` | 文档明确「blocking，不能在用主线程调用」 |
+| `rfd/src/backend/macos/file_dialog/panel_ffi.rs::Panel::run_modal` | 有 parent 时先 `beginSheetModalForWindow_completionHandler`，**随后无条件 `runModal()`** —— sheet + 嵌套独立模态，双重模态 |
+| `rfd/src/backend/macos/file_dialog/panel_ffi.rs::InnerModal for NSSavePanel` | `begin_modal` 只做 `beginSheetModalForWindow_completionHandler`；`run_modal` 才做 `runModal()` |
+| `rfd/src/backend/macos/modal_future.rs::ModalFuture::new` | `app.isRunning() && win.is_some()` 时走 `inner.begin_modal(...)`，**不调 `run_modal`**；结果经 completion block 唤醒 future |
+| `tauri-plugin-dialog/src/desktop.rs::pick_file/pick_files/pick_folder/save_file` | 公开的 callback API 把 `FileDialogBuilder` 转成 `rfd::AsyncFileDialog`（保留 `d.parent`），在 `run_on_main_thread` 里启动，另起线程 `block_on` |
+| `crates/ot-platform-core/src/webview_fs/core.rs::tools_webview_pick_*` | 宿主三个 picker 命令（修复后走上面的 callback API） |
+| `src-tauri/src/builtin_plugin_handlers.rs` | 把三个命令注册进 `generate_handler!` |
+| `src-tauri/src/platform/panel/focus.rs` / `focus_state.rs` | 面板失焦自动隐藏状态机 |
 
-`plugin:dialog|open` 本身（`tauri-plugin-dialog/src/commands.rs:123-131, 159-206`）同样用
-`blocking_pick_*`，并且 **`set_parent(&window)`**。
+也就是说：`plugin:dialog|open` 这条命令**不是** async sheet。要用真正的 async sheet，必须走
+`FileDialogBuilder.pick_*` callback / `AsyncFileDialog`，而不是命令本身。
 
-这些命令是 `async fn`，跑在 tokio 工作线程；rfd 再通过 `dispatch2::run_on_main` 同步阻塞主线程
-（`rfd/src/backend/macos/utils.rs:20-31`）。macOS 实现
-（`rfd/src/backend/macos/file_dialog/panel_ffi.rs:66-76`）是：
-
-```
-beginSheetModalForWindow(parent)   // 把 picker 挂成父窗口的 sheet
-runModal()                        // 又无条件开一次独立模态（双重模态）
-```
-
-## 2. PANEL 窗口恰好是最不适合当 sheet host 的那种窗口
+## 2. PANEL 为什么是最不适合当 sheet host 的窗口
 
 | 位置 | 行为 |
 | --- | --- |
-| `src-tauri/src/platform/panel/core.rs:27, 284-325` | label `otools-panel`；`decorations(false)` / `always_on_top(true)` / `skip_taskbar(true)` / `focused(false)` / `visible(false)` |
-| `src-tauri/src/platform/panel/core.rs:835-874` | 插件页是 `add_child` 子 webview（`panel-plugin-*`），创建即 `hide()` |
-| `src-tauri/src/platform/panel/ns_panel.rs:66, 74-76` | 换类为 `OtoolsOverlayPanel`（NSPanel）并加 `NSWindowStyleMaskNonactivatingPanel` |
-| `src-tauri/src/platform/panel/ns_panel.rs:126`、`core.rs:561-579` | 显示用 `makeKeyAndOrderFront`，注释明确「不激活宿主」 |
-| `src-tauri/src/platform/panel/focus.rs:119-188` → `core.rs:590-606` | **失焦自动隐藏面板** |
-| `src-tauri/src/lib.rs:1014-1017` | setup 把 activation policy 设为 `Accessory` |
-| `src-tauri/src/lib.rs:presentation.rs:36-52, 85-93` | `otools-panel` / `panel-plugin-*` / `main` 被排除出「可见独立窗口」，所以只剩面板可见时应用保持 Accessory（无 Dock、非 active app） |
+| `src-tauri/src/platform/panel/core.rs` | label `otools-panel`，无边框 / 置顶 / 不抢焦点 |
+| `src-tauri/src/platform/panel/ns_panel.rs` | 换类为 `NSPanel` 子类并加 `NSWindowStyleMaskNonactivatingPanel` |
+| `src-tauri/src/platform/panel/core.rs` | 插件页是 `add_child` 子 webview（`panel-plugin-*`） |
+| `src-tauri/src/platform/panel/focus.rs::check_blur_on_main` → `core.rs::hide_panel_window` | **失焦自动隐藏面板** |
+| `src-tauri/src/lib.rs` setup | activation policy = `Accessory`（无 Dock、非 active app） |
 
-rfd 的 `policy_manager.rs:15-18` **只在 `Prohibited` 时**临时把策略升到 `Accessory`；
-对已经是 `Accessory` 的应用不做任何提升（`MACOS_USE_PROHIBITED_ACTIVATION=false`，
-见 `src-tauri/src/lib.rs:38`，故 `Prohibited` 分支 `:1203` 未启用）。
+> ⚠️ 一处需要更正的旧结论：之前把「之后再打不开」归因于 rfd
+> `policy_manager.rs` 复位 activation policy 打乱 AppKit 模态状态，**这个说法不严谨**。
+> `PolicyManager::new` 只在 `initial_policy == Prohibited` 时才临时升到 `Accessory`；
+> 对本应用（已是 `Accessory`）没有任何提升，`Drop` 时 `setActivationPolicy(Accessory)`
+> 相当于写回同一个值。`FocusManager::Drop` 只是把之前的 key window
+> `makeKeyAndOrderFront`，也不是进程级模态开关。
+> 真正让后续调用继续失败的是「blocking sheet + `runModal()` 双重模态」在父窗口被强行隐藏
+> 后留下的不一致状态，以及每次调用都重新落进同一组条件；不是 activation policy 被复位。
 
-## 3. 完整的失败链
+## 3. 完整失败链（修复前）
 
-1. 插件调用 `dialog.open()` → blocking picker 以 sheet 挂到 `otools-panel` 这个
-   **NonactivatingPanel** 上。
-2. picker 弹出本身让面板失焦；`focus.rs:180-186` 的 debounce 触发 `hide_panel_window`，
-   **sheet 的父窗口被隐藏**。
-3. `beginSheetModalForWindow` 的 host 消失 → sheet 立即 dismiss；紧接着那个无条件的
-   `runModal()` 秒返回非 OK，宿主按「用户取消」记录（`core.rs:389, 499` 的 `canceled`）。
-   ⇒ **视觉上就是「闪一下就没了」**。
-4. 收尾时 `PolicyManager::drop`（rfd `policy_manager.rs:27-31`）复位 Accessory，
-   `FocusManager::drop`（rfd `focus_manager.rs:18-23`）对已经隐藏的窗口再
-   `makeKeyAndOrderFront`。这两步把 AppKit 的**进程级** modal/激活状态拧乱。
-5. 之后每次调用都仍然处在「Accessory + 无 key window + 非激活 NSPanel」的同一组条件下，
-   于是同样秒退 ⇒ **「再也无法打开任何 OS 文件选择器」**。
+1. 插件调 `dialog.open()` → blocking picker 以 sheet 挂到 `otools-panel`（NonactivatingPanel）。
+2. picker 弹出让面板失焦 → 180ms debounce 后 `hide_panel_window`，**sheet 父窗口被隐藏**。
+3. sheet 立即 dismiss；那个额外的 `runModal()` 秒返回非 OK，宿主按「用户取消」记录。
+   ⇒ 视觉上「闪一下就没了」。
+4. 双重模态会话在父窗口已隐藏的情况下收尾，嵌套 modal loop 与面板显隐状态不一致；
+   后续每次调用仍落在「Accessory + 无 key window + 非激活 NSPanel + blocking sheet」的
+   同一组条件里，于是继续秒退 ⇒ **「再也无法打开任何 OS 文件选择器」**。
 
-补充：`core.rs:376/445/490` 每次都新建 builder，rfd `file_dialog.rs:22,36,102,180`
-每次都新建 `NSOpenPanel`，**没有单例缓存**；`PANEL_SHOW_STATE`(`core.rs:531`) 和
-`FOCUS_STATE`(`focus.rs:18`) 只是显隐状态机。`src-tauri/capabilities/default.json:16-24, 52`
-已含 `dialog:default` 且 windows 覆盖 `otools-panel` / `panel-plugin-*`，**权限也排除**。
+补充排除项：宿主每次都新建 builder、rfd 每次都新建 `NSOpenPanel`，**没有单例缓存**；
+`capabilities/default.json` 已含 `dialog:default` 且 window 覆盖 `otools-panel` / `panel-plugin-*`，
+**权限也排除**。
 
-## 4. 修复 / 规避方向
+## 4. 宿主侧最终修复（OTools 主仓）
 
-> **宿主侧已修复（OTools 主仓，本次一并提交）**。实际落地的组合是下面第 2、3 项：
->
-> - `crates/ot-platform-core/src/webview_fs/dialog_guard.rs`（新增）：全局 OS 对话框会话计数 + RAII guard；三个 `tools_webview_pick_*` 把 `blocking_pick_*` 包住。
-> - `src-tauri/src/platform/panel/focus_state.rs` / `focus.rs`：会话期间（或 macOS 上 `NSApplication.modalWindow` 非空时，覆盖第三方 `plugin:dialog|open`）抑制面板自动隐藏，并持续刷新保护窗口，dialog 关闭后留 600ms 缓冲再判断。
-> - `src/platform/runtime/otools/index.ts` 与 `embedded-runtime.js`：`dialog.open/save` 改为**优先宿主命令**（`app_handle.dialog().file()` 无 `set_parent`），只在命令真正抛错时才回落 `plugin:dialog|open`；用户取消（`null`）不回落，避免二次弹框。注入运行时仍保留 `window.__otoolsHostTree` 的远程模式兜底。
->
-> 这样 sheet 的父窗口不会在 picker 期间被关掉，rfd 的收尾也不会把 AppKit 模态状态拧乱，因此可以反复打开。本插件**仍然**使用页面内文件树（第 1 项），因为它不依赖宿主版本、远程 Web 模式也能用。
->
-> 尚未实施（可选加固）：第 4、5 项。若实机仍出现「Accessory 应用下 NSOpenPanel 不激活」，再考虑临时 `Regular` 或改非 blocking 的 `pick_file_async`。
+保留 sheet，保留 parent，只修「面板被关掉」和「双重模态」这两件事。
 
-按代价从低到高：
+### 4.1 PANEL hold（根本修复）
 
-1. **插件侧彻底不弹 OS picker**（本插件采用）：用宿主 SDK 的
-   `pickFromHostTree`（`vendor/otools-plugin-sdk/src/host-file-tree.ts:111`）——页面内 DOM 树，
-   数据来自 `tools_webview_browse_dialog`（`crates/ot-platform-core/src/webview_fs/core.rs:781-803`）。
-   宿主 `dialog.open` 的回退链最后也会落到 `window.__otoolsHostTree`。
-2. 弹框期间暂停面板失焦隐藏（给 `focus.rs` 加一个「picker 进行中」保护 / `set_pinned(true)`）。
-3. 去掉 `set_parent` / 传 `parent = nil`，只保留独立 `NSOpenPanel runModal`。
-4. 弹框前临时 `setActivationPolicy(Regular)` + `activate`（rfd 只兜了 Prohibited，没兜 Accessory）。
-5. 改非 blocking 的 `pick_file_async` 并显式 `run_on_main_thread`，避免双重模态与阻塞主线程。
+* `crates/ot-platform-core/src/webview_fs/dialog_guard.rs`
+  * `ACTIVE_DIALOGS` 全局计数 + `NativeDialogGuard` RAII；
+  * `NativeDialogSession<T>` 把 guard 和 `oneshot::Sender<T>` 绑在一起：`begin_dialog()`
+    在**发起 sheet 之前**就置位，`finish()` 由 sheet 的 completion callback 调用，
+    投递结果后才释放 guard。护栏覆盖整个会话，而不是一次同步函数调用。
+* `src-tauri/src/platform/panel/focus_state.rs::check_with_hold`
+  * 会话期间失焦决策返回 `Wait` 而不是 `Hide`；长会话也不会隐藏面板。
+* `src-tauri/src/platform/panel/focus.rs::check_blur_on_main`
+  * hold 期间每次检查都 `protect()` 刷新保护窗口，dialog 关闭后留 600ms 缓冲；
+  * macOS 额外查 `NSApplication.modalWindow`，用于覆盖**第三方直接调
+    `plugin:dialog|open`** 的 blocking 会话。注意 sheet 不是进程模态，
+    `modalWindow` 对宿主自己的 async sheet 是 nil，所以宿主会话必须靠
+    `native_dialog_active()` 计数。
 
-## 5. 本插件的做法
+### 4.2 async sheet（消除双重模态）
 
-`shell/dialogs.js` 只调用 `otools-plugin-sdk` 的 `pickFromHostTree`：
+* `crates/ot-platform-core/src/webview_fs/core.rs::tools_webview_pick_files /
+  pick_save_path / pick_folder`
+  * 三个 `blocking_pick_*` 全部换成 `dialog.pick_files/pick_file/save_file/pick_folder`
+    的 callback API + `await_dialog(receiver)`；
+  * 命令多接一个 `window: Window`，`with_dialog_parent()` 在 macOS/Windows 上
+    `set_parent(&window)` —— **sheet 挂回调用窗口**（子 webview 场景就是 `otools-panel`）；
+  * rfd 走 `ModalFuture` → 只 `begin_modal`（`beginSheetModalForWindow`），
+    不 `runModal()`；主线程事件循环不被阻塞，也不会出现 sheet 与嵌套 modal 叠在一起。
+* `src/platform/runtime/otools/index.ts` 与 `embedded-runtime.js`
+  * `window.otools.dialog.open/save` 优先宿主命令（现在就是 async sheet），
+    只在命令真正抛错时回落 `plugin:dialog|open`；用户取消（`null`）不回落，避免二次弹框。
+    注入运行时仍保留 `window.__otoolsHostTree` 的远程 Web 模式兜底。
+  * 旧版本里「宿主命令无 parent、用来绕开 sheet」的说明已作废。
+
+### 4.3 单元测试覆盖
+
+* `dialog_guard.rs`：会话计数、guard 从 begin 持有到 callback、`callback` 被丢弃时
+  hold 释放且命令报错；
+* `panel::focus_state`：hold 期间不隐藏、释放后恢复自动隐藏；
+* `embedded-runtime.test.ts`（9 例）：宿主 picker 优先、抛错才回落、取消不二次弹框、save 同理。
+
+> 单测只覆盖状态机与调用顺序，**不覆盖 AppKit 真实行为**。仍需 macOS 真机验证：
+> 打开 / 取消 / 再打开、PANEL 失焦与恢复、第三方直接调 `plugin:dialog|open`、
+> 多个 picker 连续调用。
+
+## 5. 为什么没有采用「去掉 parent」
+
+按代价从低到高，曾经评估过的方向：
+
+| 方向 | 结论 |
+| --- | --- |
+| 插件侧不弹 OS picker，用 SDK 页面内文件树 | ✅ 本插件采用（见第 6 节） |
+| 弹框期间暂停面板失焦隐藏（PANEL hold） | ✅ **根本修复**，已实施 |
+| 去掉 `set_parent` / 独立 `NSOpenPanel runModal` | ❌ 只是绕过症状，且把 sheet 变成独立窗口，交互形态变了；已撤回 |
+| 弹框前临时 `setActivationPolicy(Regular)` + `activate` | ❌ 无必要，基于已更正的错误归因 |
+| 改非阻塞 `pick_file_async` | ✅ 已实施（4.2） |
+
+## 6. 本插件的做法
+
+`shell/dialogs.js` 只调用 `otools-plugin-sdk` 的 `pickFromHostTree`（页面内 DOM 树，
+数据来自 `tools_webview_browse_dialog`）：
 
 * `dialog.open({multiple,directory,title,filters})` → SDK 树，返回 string / string[] / null；
 * `dialog.save({title,defaultPath})` → SDK 树选目录 + 一个只问**文件名**的小输入框 +
@@ -98,4 +133,9 @@ rfd 的 `policy_manager.rs:15-18` **只在 `Prohibited` 时**临时把策略升�
 * `shell/sdk-shims/plugin-dialog.js` 把 SDK 内部可能触达的 `@tauri-apps/plugin-dialog`
   也导回宿主桥，保证任何路径都不会落到 OS picker。
 
-这与 `otools-zitext` 0.1.2 的结论一致（选择器改纯页面内 DOM 树、并直接复用 SDK，别自己写树）。
+这样不依赖宿主版本、远程 Web 模式也能用。与 `otools-zitext` 0.1.2 的结论一致：
+选择器改纯页面内 DOM 树、直接复用 SDK，别自己写树。
+
+> 附注：主仓 `vendor/tauri-remote-service/src/host.rs` 里的 Web 模式 dialog handler
+> 仍是 `blocking_pick_*`（无 parent）。那是服务端进程、远程浏览器本来就看不到服务器上的
+> 原生框，且不涉及 PANEL，属于另一条链路，不在本次修复范围内。
