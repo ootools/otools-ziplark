@@ -106,25 +106,130 @@
     }
   }
 
+  /* ---- open-file delivery helpers ----
+   * 统一投递出口：三个来源（URL 参数兜底、启动期 consume、敲门 consume）都汇入
+   * deliverOpenPath，5 秒滑动窗口去重后 emitLocal 本地打开——不再走
+   * push_open_file → poll_events 全局广播（多表面会各开一次）。去重窗口的代价：
+   * 5 秒内刻意重开同一文件会被忽略，此时 UI 本来就显示着它。
+   */
+  var recentDeliveries = new Map();
+  var DELIVER_DEDUPE_WINDOW_MS = 5000;
+
+  function normalizePluginUuidFromLabel(label) {
+    var raw = String(label || '').trim();
+    if (!raw) return '';
+    var splitAt = raw.lastIndexOf(':');
+    if (splitAt <= 0 || splitAt >= raw.length - 1) return raw;
+    // 宿主 label 形如 `tools-tab-plugin-market:otools-ziplark` / `panel-plugin-market:…`：
+    // 先剥表面前缀再按 source:uuid 归一化（对齐宿主 normalizeRuntimePluginUuid 的白名单）。
+    var source = raw.slice(0, splitAt).trim().toLowerCase()
+      .replace(/^(tools-tab-plugin-|panel-plugin-|plugin-)/, '');
+    var pluginId = raw.slice(splitAt + 1).trim();
+    if (source === 'builtin' || source === 'market' || source === 'dev-debug' || source === 'dev-workspace') {
+      return pluginId;
+    }
+    return raw;
+  }
+
+  function resolvePluginUuid() {
+    try {
+      var env = window.__OToolsEnv;
+      var fromEnv = env && typeof env.pluginUuid === 'string' ? env.pluginUuid.trim() : '';
+      if (fromEnv) return fromEnv;
+    } catch (_) {
+      /* fall through to the label */
+    }
+    return normalizePluginUuidFromLabel(webviewLabel());
+  }
+
+  function pruneRecentDeliveries(now) {
+    recentDeliveries.forEach(function (seenAt, delivered) {
+      if (now - seenAt >= DELIVER_DEDUPE_WINDOW_MS) recentDeliveries.delete(delivered);
+    });
+  }
+
+  function deliverOpenPath(path) {
+    var value = String(path || '').trim();
+    if (!value) return;
+    var now = Date.now();
+    pruneRecentDeliveries(now);
+    var seenAt = recentDeliveries.get(value);
+    if (typeof seenAt === 'number' && now - seenAt < DELIVER_DEDUPE_WINDOW_MS) return;
+    recentDeliveries.set(value, now);
+    emitLocal('ziplark-open-file', value);
+  }
+
+  /** SDK onOtoolsOpenFile 的回调（URL 参数 + 启动期 consume）：本地投递，不再 push。 */
+  function handleOtoolsOpenFile(files) {
+    (files || []).forEach(function (file) {
+      if (!file || !file.path) return;
+      deliverOpenPath(file.path);
+    });
+  }
+
+  /** 敲门后取走投给自己的文件列表。走 wrapped `otools.invoke`：native 先报
+   * Unknown method、命中回落标记后自动落到宿主命令（老宿主 dylib 无此方法）。 */
+  async function consumeOpenFiles() {
+    var api = hostApi();
+    if (!api || typeof api.invoke !== 'function') {
+      log('consume_open_files skipped: otools.invoke unavailable');
+      return;
+    }
+    var uuid = resolvePluginUuid();
+    if (!uuid) return;
+    try {
+      var paths = await api.invoke('otools_consume_open_files', {pluginUuid: uuid});
+      (Array.isArray(paths) ? paths : []).forEach(function (path) {
+        deliverOpenPath(path);
+      });
+    } catch (error) {
+      log('consume_open_files failed: ' + String(error && error.message || error));
+    }
+  }
+
+  /** 敲门监听 target：与拖拽（startDragEvents）同一套兜底策略。宿主 emit_to 的
+   * AnyLabel 只匹配带 label 的监听器，默认 Any 永远收不到——这正是本修复的根因。 */
+  function knockListenerTargets() {
+    var webview = webviewLabel();
+    var win = windowLabel();
+    var targets = [];
+    if (webview) targets.push({kind: 'Webview', label: webview});
+    if (win && win !== webview) targets.push({kind: 'Window', label: win});
+    if (!targets.length) targets.push({kind: 'Any'});
+    return targets;
+  }
+
+  async function startKnockListener() {
+    try {
+      var rt = await import('./sdk/runtime.js');
+      if (typeof rt.listenTauri !== 'function') return;
+      // 事件名与 SDK 的 OTOOLS_FILE_DELIVER_EVENT 对齐（宿主 emit_to("otools-open-file")）。
+      var jobs = knockListenerTargets().map(function (target) {
+        return rt.listenTauri('otools-open-file', function () {
+          void consumeOpenFiles();
+        }, {target: target}).catch(function (error) {
+          log('knock listener -> ' + target.kind + ' failed: ' + String(error));
+        });
+      });
+      await Promise.all(jobs);
+    } catch (error) {
+      log('knock listener unavailable: ' + String(error && error.message || error));
+    }
+  }
+
   /* ---- OS "open with" / file association delivery ----
    * plugin.json declares `fileAssociations`; the host routes a double-clicked
    * archive to us via `otools-open-file` + `otools_consume_open_files`.
-   * Everything is funnelled through the native layer's `push_open_file`, which
-   * both queues a `ziplark-open-file` poll event and stores the startup
-   * fallback path for `take_pending_file()`. Emulating the event locally here
-   * would bypass that fallback and lose a cold-start delivery.
+   * 两条来源（SDK 工厂回调：URL 参数 + 启动期 consume；以及敲门直连监听）都汇入
+   * deliverOpenPath 本地投递——push_open_file → poll_events 广播链已退役
+   * （多表面会各开一次），dylib 的方法保留但闲置。
    */
   async function startOpenFileDelivery() {
     try {
       var sdk = await import('./sdk/index.js');
       if (typeof sdk.onOtoolsOpenFile !== 'function') return;
       await sdk.onOtoolsOpenFile(function (files) {
-        (files || []).forEach(function (file) {
-          if (!file || !file.path) return;
-          invoke('push_open_file', { path: file.path }).catch(function (error) {
-            log('push_open_file failed: ' + String(error && error.message || error));
-          });
-        });
+        handleOtoolsOpenFile(files);
       });
     } catch (error) {
       log('onOtoolsOpenFile unavailable: ' + String(error && error.message || error));
@@ -184,6 +289,7 @@
     started = true;
     startNativeEvents();
     startOpenFileDelivery();
+    startKnockListener();
     startDragEvents();
   }
 
@@ -222,5 +328,16 @@
     open: dialogOpen,
     save: dialogSave,
     log: log,
+  };
+
+  // 纯逻辑测试钩子（node:vm 加载本文件后驱动）；宿主集成行为由端到端验证覆盖。
+  window.__ZIPLARK_TEST__ = {
+    normalizePluginUuidFromLabel: normalizePluginUuidFromLabel,
+    resolvePluginUuid: resolvePluginUuid,
+    deliverOpenPath: deliverOpenPath,
+    recentDeliveries: recentDeliveries,
+    handleOtoolsOpenFile: handleOtoolsOpenFile,
+    consumeOpenFiles: consumeOpenFiles,
+    knockListenerTargets: knockListenerTargets,
   };
 })();

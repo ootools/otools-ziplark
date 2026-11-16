@@ -38,6 +38,33 @@ function copyTree(source, target) {
   }
 }
 
+// main.js 锚点补丁：在状态声明之后注入 `__ztState` 读写出口（currentArchive /
+// archiveStack / tree 是脚本作用域 let/const，tabs.js 从外部不可达）。这是 dist
+// main.js 相对 upstream 唯一允许的差异，设计见 docs/tabs-design.md §1。
+export const MAIN_PATCH_ANCHOR = 'let createInputs = [];';
+export const MAIN_PATCH_START = '/* ziplark-tabs: 状态出口（build 注入，见 docs/tabs-design.md §1；勿手改） */';
+export const MAIN_PATCH_END = '/* ziplark-tabs:end */';
+export const MAIN_PATCH_BLOCK =
+  MAIN_PATCH_START + '\n' +
+  'window.__ztState = {\n' +
+  '  getCurrentArchive() { return currentArchive; },\n' +
+  '  setCurrentArchive(v) { currentArchive = v; },\n' +
+  '  getArchiveStack() { return archiveStack; },\n' +
+  '  setArchiveStack(v) { archiveStack = v; },\n' +
+  '  getTree() { return tree; },\n' +
+  '};\n' +
+  MAIN_PATCH_END + '\n';
+
+export function applyMainPatch(source) {
+  if (source.includes(MAIN_PATCH_START)) return source;
+  const anchorAt = source.indexOf(MAIN_PATCH_ANCHOR);
+  if (anchorAt < 0) throw new Error('mainPatchAnchorMissing');
+  const lineEnd = source.indexOf('\n', anchorAt);
+  if (lineEnd < 0) throw new Error('mainPatchAnchorUnterminated');
+  const insertAt = lineEnd + 1;
+  return source.slice(0, insertAt) + MAIN_PATCH_BLOCK + source.slice(insertAt);
+}
+
 export function buildWeb(directory = root) {
   const upstream = path.join(directory, 'upstream/ui');
   const shell = path.join(directory, 'shell');
@@ -47,7 +74,7 @@ export function buildWeb(directory = root) {
   for (const file of ['index.html', 'main.js', 'styles.css', 'logo.png']) {
     if (!fs.existsSync(path.join(upstream, file))) throw new Error('upstreamUiMissing: ' + file);
   }
-  for (const file of ['host-bridge.js', 'dialogs.js', 'bridge.css']) {
+  for (const file of ['host-bridge.js', 'dialogs.js', 'tabs.js', 'bridge.css']) {
     if (!fs.existsSync(path.join(shell, file))) throw new Error('shellOverlayMissing: ' + file);
   }
   if (!fs.existsSync(path.join(sdk, 'index.js'))) throw new Error('sdkDistMissing');
@@ -59,7 +86,9 @@ export function buildWeb(directory = root) {
   for (const file of ['main.js', 'styles.css', 'logo.png']) {
     copyFile(path.join(upstream, file), path.join(dist, file));
   }
-  for (const file of ['host-bridge.js', 'dialogs.js', 'bridge.css']) {
+  const distMainPath = path.join(dist, 'main.js');
+  fs.writeFileSync(distMainPath, applyMainPatch(fs.readFileSync(distMainPath, 'utf8')));
+  for (const file of ['host-bridge.js', 'dialogs.js', 'tabs.js', 'bridge.css']) {
     copyFile(path.join(shell, file), path.join(dist, file));
   }
   copyTree(path.join(shell, 'sdk-shims'), path.join(dist, 'sdk-shims'));
@@ -74,7 +103,10 @@ export function buildWeb(directory = root) {
   if (!html.includes('<script src="main.js"></script>')) throw new Error('upstreamEntryChanged');
   if (!html.includes('</head>')) throw new Error('upstreamHeadMissing');
   html = html.replace('</head>', IMPORT_MAP + '  </head>');
-  html = html.replace('<script src="main.js"></script>', bridgeTag + '    <script src="main.js"></script>');
+  html = html.replace(
+    '<script src="main.js"></script>',
+    bridgeTag + '    <script src="main.js"></script>\n' + '    <script src="tabs.js"></script>'
+  );
   fs.writeFileSync(path.join(dist, 'index.html'), html);
 
   // Guardrails: the bridge must be installed before main.js, the SDK must be
@@ -82,6 +114,9 @@ export function buildWeb(directory = root) {
   const built = fs.readFileSync(path.join(dist, 'index.html'), 'utf8');
   if (built.indexOf('host-bridge.js') > built.indexOf('<script src="main.js"')) {
     throw new Error('bridgeOrderInvalid');
+  }
+  if (built.indexOf('tabs.js') < built.indexOf('<script src="main.js"')) {
+    throw new Error('tabsOrderInvalid');
   }
   if (!fs.existsSync(path.join(dist, 'sdk/index.js')) || !fs.existsSync(path.join(dist, 'sdk/runtime.js'))) {
     throw new Error('sdkCopyIncomplete');
