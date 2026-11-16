@@ -105,6 +105,10 @@ Tauri 2.10（`manager/mod.rs` `emit_to`/`filter_target`）对 `AnyLabel{label}` 
 - `dispatchFileOpenTo` 的 existingTab 分支把激活的标签 label 作为 `targetLabel`
   传给 `otools_queue_file_delivery`（当前投递不带 target、广播给所有 webview）；
   敲门只发给目标 webview，配合 3A 的先到先得，落点确定。
+- 定向条目的防滞留（终审 P2 修复）：`drain_deliveries` 增加 label 存活判定——
+  目标 webview 已关（不在绑定表）时放开为无目标投递，任何同插件表现面可取走；
+  面板激活失败时前端退回无目标投递。否则条目会在队列里等到同 label 重建或被
+  128 条上限挤掉，复现同类静默丢件。
 - 新增 PANEL 分支：插件 openMode 为 `panel` 且其面板 webview 活着时，
   **唤起面板并投递到面板 webview**（targetLabel = 面板 webview label），
   不再冗余新开标签；面板未开时维持现状（新开标签）。
