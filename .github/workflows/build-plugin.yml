@@ -1,0 +1,105 @@
+name: build-plugin
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, platform: macos, arch: arm64, artifact: macos, library: macOS-arm64.dylib}
+          - {os: macos-15-intel, platform: macos, arch: x64, artifact: macos-intel, library: macOS-x86_64.dylib}
+          - {os: windows-latest, platform: windows, arch: x64, artifact: windows, library: Windows-x64.dll}
+          - {os: windows-11-arm, platform: windows, arch: arm64, artifact: windows-arm, library: Windows-arm64.dll}
+          - {os: ubuntu-latest, platform: linux, arch: x64, artifact: linux, library: Linux-x64.so}
+          - {os: ubuntu-24.04-arm, platform: linux, arch: arm64, artifact: linux-arm, library: Linux-arm64.so}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native -> target
+          key: ziplark-${{ matrix.artifact }}
+      - name: Test the independent native workspace
+        run: cargo test --locked --manifest-path native/Cargo.toml
+      - name: Build and verify the native ABI
+        run: node scripts/build-native.mjs --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-native-${{ matrix.artifact }}
+          path: lib/${{ matrix.library }}
+          if-no-files-found: error
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify the upstream snapshot and vendored SDK are untouched
+        run: |
+          node scripts/sync-upstream.mjs --check
+          node scripts/sync-sdk.mjs --check
+      - name: Overlay regression tests
+        run: node --test scripts/*.test.mjs
+      - name: Build the static frontend overlay
+        run: node scripts/build-web.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-web
+          path: dist/
+          if-no-files-found: error
+
+  package:
+    needs: [native, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-web
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: plugin-native-*
+          merge-multiple: true
+          path: lib
+      - name: Install cross-platform symbol inspector
+        run: sudo apt-get update && sudo apt-get install -y llvm
+      - name: Pack validated per-platform artifacts
+        run: |
+          node scripts/pack-plugin.mjs --platform macos --arch arm64
+          node scripts/pack-plugin.mjs --platform macos --arch x64
+          node scripts/pack-plugin.mjs --platform windows --arch x64
+          node scripts/pack-plugin.mjs --platform windows --arch arm64
+          node scripts/pack-plugin.mjs --platform linux --arch x64
+          node scripts/pack-plugin.mjs --platform linux --arch arm64
+          node scripts/verify-plugin.mjs dist-pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-oplg
+          path: dist-pack/
+          if-no-files-found: error

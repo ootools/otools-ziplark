@@ -1,0 +1,71 @@
+name: release-plugin
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只构建校验，不创建 Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-plugin.yml
+
+  release:
+    needs: build
+    if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify tag matches plugin.json version
+        if: ${{ github.event_name == 'push' }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION=$(node -p "require('./plugin.json').version")
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "tag $TAG does not match plugin.json version v$VERSION" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: plugin-oplg
+          path: dist-pack
+          run-id: ${{ github.run_id }}
+      - name: Verify every package independently
+        run: node scripts/verify-plugin.mjs dist-pack
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Ziplark Archiver ${{ github.ref_name }}
+          body: |
+            OTools 独立插件 `otools-ziplark`。六平台分包（packageMode=1），
+            安装对应平台的 `.oplg` 即可。校验值见 SHA256SUMS。
+          files: |
+            dist-pack/**/*.oplg
+            dist-pack/**/SHA256SUMS
+            dist-pack/**/plugin.json
+            dist-pack/**/logo.svg
+          fail_on_unmatched_files: true
+      - name: Build summary
+        run: |
+          find dist-pack -name '*.oplg' -printf '%f %s bytes\n' | sort >> "$GITHUB_STEP_SUMMARY"

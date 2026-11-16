@@ -1,0 +1,21 @@
+{
+  "name": "otools-ziplark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ziplark archive engine as an independent OTools plugin (native cdylib + host SDK file picker)",
+  "license": "MIT",
+  "scripts": {
+    "build:web": "node scripts/build-web.mjs",
+    "build:native": "node scripts/build-native.mjs",
+    "pack": "node scripts/pack-plugin.mjs",
+    "verify": "node scripts/verify-plugin.mjs dist-pack",
+    "test": "node --test scripts/*.test.mjs",
+    "sync:upstream": "node scripts/sync-upstream.mjs",
+    "sync:upstream:check": "node scripts/sync-upstream.mjs --check",
+    "sync:sdk:check": "node scripts/sync-sdk.mjs --check"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

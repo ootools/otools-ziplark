@@ -1,0 +1,29 @@
+[package]
+name = "otools-ziplark-native"
+version = "0.1.0"
+edition = "2021"
+description = "OTools native plugin backend for the Ziplark archive engine"
+
+[lib]
+name = "otools_ziplark_native"
+crate-type = ["cdylib", "rlib"]
+
+# 独立 workspace：不继承上游 root 的 profile / workspace.package 字段。
+[workspace]
+members = ["."]
+resolver = "2"
+
+[dependencies]
+ziplark-core = { path = "ziplark-core" }
+ot-plugin-ffi = { path = "../vendor/ot-plugin-ffi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+# macOS 27 上 strip="debuginfo" 会产出 dyld 拒绝加载的 Mach-O。
+strip = "none"

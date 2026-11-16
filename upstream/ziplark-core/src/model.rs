@@ -1,0 +1,397 @@
+use serde::Serialize;
+use std::path::PathBuf;
+
+/// Archive formats the engine understands. `can_create()` reports whether we
+/// can *write* the format (some, like RAR, are extract-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    Zip,
+    SevenZ,
+    Rar,
+    Tar,
+    TarGz,
+    TarBz2,
+    TarXz,
+    TarZst,
+    Gz,
+    Bz2,
+    Xz,
+    Zst,
+    Lz4,
+    TarLz4,
+    /// ISO 9660 / Joliet disc image (extract-only).
+    Iso,
+    /// Unix `ar` archive / static library (`.ar`, `.a`) (extract-only).
+    Ar,
+    /// Debian software package (`.deb`, `.udeb`, `.ipk`) (extract-only).
+    Deb,
+    /// POSIX / SVR4 `cpio` archive (`.cpio`) (extract-only).
+    Cpio,
+    /// Red Hat software package (`.rpm`) (extract-only).
+    Rpm,
+    /// Microsoft Cabinet archive (`.cab`) (extract-only).
+    Cab,
+    /// eXtensible ARchive (`.xar`, `.xip`, `.safariextz`) (extract-only).
+    Xar,
+    /// macOS Installer package (`.pkg`, `.mpkg`) (extract-only).
+    Pkg,
+}
+
+impl Format {
+    /// Whether the engine can create (write) this format.
+    pub fn can_create(self) -> bool {
+        !matches!(
+            self,
+            Format::Rar
+                | Format::Iso
+                | Format::Ar
+                | Format::Deb
+                | Format::Cpio
+                | Format::Rpm
+                | Format::Cab
+                | Format::Xar
+                | Format::Pkg
+        )
+    }
+
+    /// Whether entries can be added to an existing archive of this format.
+    pub fn can_modify(self) -> bool {
+        matches!(
+            self,
+            Format::Zip
+                | Format::SevenZ
+                | Format::Tar
+                | Format::TarGz
+                | Format::TarBz2
+                | Format::TarXz
+                | Format::TarZst
+                | Format::TarLz4
+        )
+    }
+
+    /// Human-readable label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Format::Zip => "ZIP",
+            Format::SevenZ => "7z",
+            Format::Rar => "RAR",
+            Format::Tar => "TAR",
+            Format::TarGz => "TAR.GZ",
+            Format::TarBz2 => "TAR.BZ2",
+            Format::TarXz => "TAR.XZ",
+            Format::TarZst => "TAR.ZST",
+            Format::Gz => "GZIP",
+            Format::Bz2 => "BZIP2",
+            Format::Xz => "XZ",
+            Format::Zst => "ZSTD",
+            Format::Lz4 => "LZ4",
+            Format::TarLz4 => "TAR.LZ4",
+            Format::Iso => "ISO",
+            Format::Ar => "AR",
+            Format::Deb => "DEB",
+            Format::Cpio => "CPIO",
+            Format::Rpm => "RPM",
+            Format::Cab => "CAB",
+            Format::Xar => "XAR",
+            Format::Pkg => "PKG",
+        }
+    }
+
+    /// Canonical extension (without leading dot) used when creating.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Zip => "zip",
+            Format::SevenZ => "7z",
+            Format::Rar => "rar",
+            Format::Tar => "tar",
+            Format::TarGz => "tar.gz",
+            Format::TarBz2 => "tar.bz2",
+            Format::TarXz => "tar.xz",
+            Format::TarZst => "tar.zst",
+            Format::Gz => "gz",
+            Format::Bz2 => "bz2",
+            Format::Xz => "xz",
+            Format::Zst => "zst",
+            Format::Lz4 => "lz4",
+            Format::TarLz4 => "tar.lz4",
+            Format::Iso => "iso",
+            Format::Ar => "ar",
+            Format::Deb => "deb",
+            Format::Cpio => "cpio",
+            Format::Rpm => "rpm",
+            Format::Cab => "cab",
+            Format::Xar => "xar",
+            Format::Pkg => "pkg",
+        }
+    }
+}
+
+/// One entry (file or directory) inside an archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveEntry {
+    /// Path of the entry as stored in the archive (forward slashes).
+    pub path: String,
+    pub is_dir: bool,
+    /// Uncompressed size in bytes.
+    pub size: u64,
+    /// Compressed size in bytes if known.
+    pub compressed_size: Option<u64>,
+    /// Whether this individual entry is encrypted.
+    pub encrypted: bool,
+    /// Last-modified time as a unix timestamp (seconds) if known.
+    pub modified: Option<i64>,
+    /// CRC32 if the format records one.
+    pub crc32: Option<u32>,
+    /// The entry's data is split across volumes of a multi-volume archive, so
+    /// reading it needs more than the volume it starts in.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub split: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Properties of the archive as a whole, as opposed to its entries. Formats
+/// that cannot express one of these leave it `false`.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ArchiveAttributes {
+    /// Entries share one compression stream. Reading the last file means
+    /// decompressing everything before it, which is why picking one file out
+    /// of a solid archive is slow.
+    pub solid: bool,
+    /// Carries a recovery record: enough redundancy to repair damage.
+    pub recovery_record: bool,
+    /// The entry *names* are encrypted too, so even listing needs the password.
+    pub encrypted_headers: bool,
+    /// Locked against modification by the tool that wrote it (RAR `-k`).
+    pub locked: bool,
+}
+
+/// Summary of an archive's contents.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveInfo {
+    pub format: Format,
+    pub path: PathBuf,
+    pub entries: Vec<ArchiveEntry>,
+    /// True if any entry (or the header) is encrypted.
+    pub encrypted: bool,
+    pub total_size: u64,
+    pub total_compressed: u64,
+    /// Every file that makes up this archive, in order, when it is split into
+    /// volumes (`part1.rar`, `part2.rar`, …). Empty for a single-file archive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<PathBuf>,
+    /// The volume that should come next but is not on disk. `Some` means the
+    /// set is incomplete and the tail of the archive cannot be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_volume: Option<PathBuf>,
+    /// The archive's comment, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    pub attributes: ArchiveAttributes,
+}
+
+/// Per-entry progress during extract/create/test.
+#[derive(Debug, Clone, Serialize)]
+pub struct Progress {
+    pub current_path: String,
+    pub entries_done: u64,
+    pub entries_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+/// Result of an extract operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtractReport {
+    pub files_written: u64,
+    pub dirs_created: u64,
+    pub bytes_written: u64,
+    pub dest: PathBuf,
+    /// Entries that could not be extracted, each as `path: reason`. Only ever
+    /// non-empty when the caller asked to keep going past failures
+    /// (`ExtractOptions::keep_broken`); otherwise the first failure is an error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<String>,
+    /// Entries that were written but are **incomplete** — as much of the file
+    /// as the archive actually contained. Salvaging leaves these on disk on
+    /// purpose; they are listed so nobody mistakes one for the whole file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial: Vec<String>,
+}
+
+/// Result of a create operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateReport {
+    pub output: PathBuf,
+    pub format: Format,
+    pub entries_added: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// Volume files written when `split_size` was used (`archive.zip.001`, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<PathBuf>,
+}
+
+/// Result of an integrity test.
+#[derive(Debug, Clone, Serialize)]
+pub struct TestReport {
+    pub ok: bool,
+    pub entries_tested: u64,
+    pub bad_entries: Vec<String>,
+}
+
+/// Content of a single entry read directly from an archive without extracting
+/// to disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryContent {
+    /// Canonical path of the entry inside the archive.
+    pub path: String,
+    /// Full uncompressed size of the entry in bytes.
+    pub size: u64,
+    /// Byte offset inside the entry where `bytes` begins.
+    pub offset: u64,
+    /// Raw bytes read from `[offset .. offset + bytes.len()]`.
+    pub bytes: Vec<u8>,
+    /// True if the entry continues past `offset + bytes.len()`.
+    pub truncated: bool,
+}
+
+/// A single matching line found inside an archive entry by [`crate::grep`].
+#[derive(Debug, Clone, Serialize)]
+pub struct GrepMatch {
+    /// Entry path inside the archive.
+    pub path: String,
+    /// 1-based line number inside the entry.
+    pub line_number: u64,
+    /// Matched line text (trimmed of trailing newline; capped if very long).
+    pub line: String,
+}
+
+/// Result of searching file contents inside an archive (`grep`).
+#[derive(Debug, Clone, Serialize)]
+pub struct GrepReport {
+    pub pattern: String,
+    pub matches: Vec<GrepMatch>,
+    pub files_searched: u64,
+    pub files_matched: u64,
+    /// True if the search stopped early because `max_matches` was reached.
+    pub truncated: bool,
+}
+
+/// Result of removing entries from an archive (`remove`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveReport {
+    pub output: PathBuf,
+    pub format: Format,
+    pub entries_removed: u64,
+    pub entries_remaining: u64,
+    pub bytes_out: u64,
+}
+
+/// Result of converting an archive from one format to another (`convert`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvertReport {
+    pub source: PathBuf,
+    pub source_format: Format,
+    pub output: PathBuf,
+    pub output_format: Format,
+    pub entries_converted: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+/// Result of renaming or moving entries inside an archive (`rename`).
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameReport {
+    pub output: PathBuf,
+    pub format: Format,
+    pub from: String,
+    pub to: String,
+    pub entries_renamed: u64,
+    pub bytes_out: u64,
+}
+
+/// Supported hash algorithms for [`crate::hash`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HashAlgorithm {
+    #[default]
+    Sha256,
+    Sha1,
+    Crc32,
+}
+
+impl HashAlgorithm {
+    pub fn label(self) -> &'static str {
+        match self {
+            HashAlgorithm::Sha256 => "sha256",
+            HashAlgorithm::Sha1 => "sha1",
+            HashAlgorithm::Crc32 => "crc32",
+        }
+    }
+}
+
+/// Hash digest of a single entry inside an archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryHash {
+    pub path: String,
+    pub size: u64,
+    pub digest: String,
+}
+
+/// Result of computing cryptographic/CRC digests of entries inside an archive (`hash`).
+#[derive(Debug, Clone, Serialize)]
+pub struct HashReport {
+    pub path: PathBuf,
+    pub format: Format,
+    pub algorithm: HashAlgorithm,
+    pub entries: Vec<EntryHash>,
+    pub files_hashed: u64,
+    pub total_bytes: u64,
+}
+
+/// Kind of change detected between two archives by [`crate::diff`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffStatus {
+    Added,
+    Removed,
+    Modified,
+}
+
+/// A single entry difference between `left` and `right` archives.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffEntry {
+    pub path: String,
+    pub status: DiffStatus,
+    pub is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_crc32: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_crc32: Option<u32>,
+    /// Optional unified text diff patch when `content` diffing is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<String>,
+}
+
+/// Result of comparing two archives (`diff`).
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffReport {
+    pub left: PathBuf,
+    pub left_format: Format,
+    pub right: PathBuf,
+    pub right_format: Format,
+    pub added: u64,
+    pub removed: u64,
+    pub modified: u64,
+    pub unchanged: u64,
+    pub changes: Vec<DiffEntry>,
+}
+

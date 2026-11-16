@@ -1,0 +1,19 @@
+# Native build output / compiled artifacts are produced by CI.
+native/target/
+lib/*.dylib
+lib/*.dll
+lib/*.so
+lib/*.dylib.*
+lib/*.dll.*
+lib/*.so.*
+
+# Generated release packages (kept out of git; uploaded as CI artifacts).
+dist-pack/
+artifacts/
+*.oplg.tmp
+
+# Local noise
+node_modules/
+.DS_Store
+*.log
+.env

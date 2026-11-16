@@ -1,0 +1,393 @@
+pub mod ar;
+pub mod cab;
+pub mod cpio;
+pub mod iso;
+pub mod rar;
+pub mod sevenz;
+pub mod stream;
+pub mod tar;
+pub mod xar;
+pub mod zip;
+
+use crate::error::{Error, Result};
+use crate::model::{EntryContent, Progress};
+use crate::ReadOptions;
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+
+/// How much we move per read/write when copying an entry. Small enough that a
+/// cancel is acted on promptly even inside a multi-gigabyte file.
+const COPY_CHUNK: usize = 128 * 1024;
+
+/// Hand a progress report to the caller, turning a "stop" answer into the
+/// cancellation error so call sites can just use `?`.
+pub fn report(progress: &mut dyn FnMut(Progress) -> bool, p: Progress) -> Result<()> {
+    if progress(p) {
+        Ok(())
+    } else {
+        Err(Error::Cancelled)
+    }
+}
+
+/// Copy an entry, reporting progress as it goes and stopping when asked.
+///
+/// `io::copy` would be a single uninterruptible call: on a large file that
+/// means no progress until it finishes and no way to cancel until then. `tick`
+/// is called with the running byte count and returns false to abort.
+pub fn copy_watched<R: Read + ?Sized, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    mut tick: impl FnMut(u64) -> bool,
+) -> Result<u64> {
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        writer.write_all(&buf[..n])?;
+        total += n as u64;
+        if !tick(total) {
+            return Err(Error::Cancelled);
+        }
+    }
+}
+
+/// Read up to `opts.max_bytes` starting at `opts.offset` from an entry stream
+/// without touching the disk.
+pub fn read_bounded<R: Read + ?Sized>(
+    reader: &mut R,
+    path: String,
+    size: u64,
+    opts: &ReadOptions,
+) -> Result<EntryContent> {
+    if opts.offset > 0 {
+        let mut skip = (&mut *reader).take(opts.offset);
+        io::copy(&mut skip, &mut io::sink())?;
+    }
+    let cap = opts.max_bytes.min(64 * 1024 * 1024);
+    let mut bytes = Vec::new();
+    (&mut *reader).take(cap).read_to_end(&mut bytes)?;
+    // Probe 1 more byte to know for sure if the stream continues (even for
+    // formats like `.gz` where `size` is 0 / unknown beforehand).
+    let mut probe = [0u8; 1];
+    let has_more = reader.read(&mut probe)? > 0;
+    let known_end = opts.offset.saturating_add(bytes.len() as u64);
+    let truncated = has_more || (size > 0 && known_end < size);
+    let effective_size = size.max(known_end + u64::from(has_more));
+    Ok(EntryContent {
+        path,
+        size: effective_size,
+        offset: opts.offset,
+        bytes,
+        truncated,
+    })
+}
+
+/// Guards every write an extraction makes against escaping the destination.
+///
+/// There are two separate ways out of `dest`, and a guard is only worth
+/// anything if it stops both:
+///
+/// 1. **By name** — `../../etc/passwd`, `/etc/passwd`, `C:\...`. Handled by
+///    [`safe_join`], which is a pure function of the entry name.
+/// 2. **Through a symlink** — an archive stores `evil -> /tmp` and then an
+///    entry named `evil/owned.txt`. That second name contains no `..` at all,
+///    so a name-only check waves it through, and the write lands in `/tmp`.
+///    Only looking at what is actually on disk catches this.
+///
+/// So `join` does both: it validates the name, then walks the directories the
+/// write would descend through and refuses if any of them is a symlink. Results
+/// are cached, since archives share ancestors between consecutive entries.
+///
+/// The symlink may have been planted by an earlier entry of the same archive,
+/// or have been sitting in `dest` beforehand — the guard does not care which.
+pub struct DestGuard {
+    dest: PathBuf,
+    /// Directories already confirmed to be real directories, not symlinks.
+    verified: HashSet<PathBuf>,
+}
+
+impl DestGuard {
+    pub fn new(dest: impl Into<PathBuf>) -> Self {
+        Self {
+            dest: dest.into(),
+            verified: HashSet::new(),
+        }
+    }
+
+    /// Validate `entry_path` and return the path to write to.
+    pub fn join(&mut self, entry_path: &str) -> Result<PathBuf> {
+        let out = safe_join(&self.dest, entry_path)?;
+        self.verify_ancestors(&out, entry_path)?;
+        Ok(out)
+    }
+
+    /// Drop any cached judgement about `path` — call after replacing it with
+    /// something that is no longer a plain directory (a symlink, say).
+    pub fn forget(&mut self, path: &Path) {
+        self.verified.remove(path);
+    }
+
+    /// Refuse if any directory between `dest` and the entry is a symlink.
+    fn verify_ancestors(&mut self, out: &Path, entry_path: &str) -> Result<()> {
+        let Ok(rel) = out.strip_prefix(&self.dest) else {
+            return Err(Error::PathTraversal(entry_path.to_string()));
+        };
+        let comps: Vec<Component> = rel.components().collect();
+        // The last component is the entry itself; only what we descend
+        // *through* has to be a real directory.
+        let depth = comps.len().saturating_sub(1);
+
+        let mut cur = self.dest.clone();
+        for comp in comps.into_iter().take(depth) {
+            cur.push(comp);
+            if self.verified.contains(&cur) {
+                continue;
+            }
+            match std::fs::symlink_metadata(&cur) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    return Err(Error::PathTraversal(entry_path.to_string()));
+                }
+                // A real directory (or file — the write will fail on its own).
+                Ok(_) => {
+                    self.verified.insert(cur.clone());
+                }
+                // Doesn't exist yet; it will be created as a real directory.
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Prepare `path` to be written as a fresh file, honouring `overwrite`.
+///
+/// Uses `symlink_metadata`, not `exists()`: a symlink at the leaf — including a
+/// *dangling* one, which `exists()` reports as absent — would otherwise
+/// redirect the write to wherever it points. The link itself is removed rather
+/// than followed.
+pub fn prepare_leaf(path: &Path, overwrite: bool) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            if !overwrite {
+                return Err(Error::other(format!(
+                    "{} already exists (use overwrite)",
+                    path.display()
+                )));
+            }
+            if md.file_type().is_symlink() {
+                std::fs::remove_file(path)?;
+            }
+            Ok(())
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+/// Create the directory a directory entry asks for, refusing to follow a
+/// symlink standing where that directory should be.
+///
+/// `create_dir_all` follows symlinks: if an earlier entry planted `evil ->
+/// /tmp`, a later directory entry named `evil` would make a directory in
+/// `/tmp` instead — a write outside the destination, from an entry name
+/// containing no `..` at all. A link already sitting in the destination does
+/// the same thing, so what is on disk is what gets checked.
+pub fn prepare_dir(path: &Path, entry_path: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => Err(Error::PathTraversal(entry_path.to_string())),
+        // Already a real directory (or a file, in which case the create below
+        // fails on its own terms).
+        Ok(_) => Ok(()),
+        Err(_) => {
+            std::fs::create_dir_all(path)?;
+            Ok(())
+        }
+    }
+}
+
+/// `prepare_leaf` + `File::create`, which is what every format's file-writing
+/// path wants.
+pub fn create_file(path: &Path, overwrite: bool) -> Result<File> {
+    prepare_leaf(path, overwrite)?;
+    Ok(File::create(path)?)
+}
+
+/// Join an archive-internal entry path onto `dest`, refusing anything that
+/// would escape `dest` (absolute paths, `..`, drive prefixes). This is the
+/// name-level half of the guard; extraction goes through [`DestGuard`], which
+/// adds the on-disk half.
+pub fn safe_join(dest: &Path, entry_path: &str) -> Result<PathBuf> {
+    // Normalise separators; archives may use either.
+    let normalized = entry_path.replace('\\', "/");
+    let mut out = dest.to_path_buf();
+
+    for comp in Path::new(&normalized).components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            // Reject anything that could climb out of `dest`.
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::PathTraversal(entry_path.to_string()));
+            }
+        }
+    }
+
+    // Defense in depth: the resolved path must still be under `dest`.
+    if !out.starts_with(dest) {
+        return Err(Error::PathTraversal(entry_path.to_string()));
+    }
+    Ok(out)
+}
+
+/// What an input is, as far as archiving is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    File,
+    /// A directory with no children, kept so extraction can recreate it.
+    EmptyDir,
+    /// A symlink, stored as a link rather than as a copy of what it points at.
+    Symlink,
+}
+
+/// One thing to put into an archive.
+pub struct Input {
+    /// Where it lives on disk.
+    pub path: PathBuf,
+    /// The name it gets inside the archive (forward slashes; a trailing slash
+    /// marks an empty directory).
+    pub rel: String,
+    pub kind: InputKind,
+}
+
+/// Walk a set of input files/dirs into the entries an archive should contain.
+/// A directory `foo` becomes `foo/...`; a file `bar.txt` becomes `bar.txt`.
+///
+/// Symlinks are reported as symlinks and never followed. Following them would
+/// store a second copy of whatever they point at — turning a tree of links into
+/// a much larger archive, and quietly breaking macOS `.app` bundles, which are
+/// held together by links — and a link that points back up its own tree would
+/// send the walk round forever.
+pub fn collect_inputs(inputs: &[PathBuf]) -> Result<Vec<Input>> {
+    let mut out = Vec::new();
+    for input in inputs {
+        let input = input.as_path();
+        let meta = std::fs::symlink_metadata(input)
+            .map_err(|_| Error::other(format!("input does not exist: {}", input.display())))?;
+        let rel = input
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| Error::other(format!("invalid input name: {}", input.display())))?
+            .to_string();
+
+        let ty = meta.file_type();
+        if ty.is_symlink() {
+            out.push(Input { path: input.to_path_buf(), rel, kind: InputKind::Symlink });
+        } else if ty.is_dir() {
+            walk_dir(input, &rel, &mut out)?;
+        } else {
+            out.push(Input { path: input.to_path_buf(), rel, kind: InputKind::File });
+        }
+    }
+    Ok(out)
+}
+
+fn walk_dir(dir: &Path, prefix: &str, out: &mut Vec<Input>) -> Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::result::Result<_, _>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    if entries.is_empty() {
+        out.push(Input {
+            path: dir.to_path_buf(),
+            rel: format!("{prefix}/"),
+            kind: InputKind::EmptyDir,
+        });
+        return Ok(());
+    }
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let rel = format!("{prefix}/{name}");
+        let child = entry.path();
+        // A DirEntry's file_type does not follow symlinks, which is what stops
+        // a link pointing back up the tree from recursing forever.
+        let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            out.push(Input { path: child, rel, kind: InputKind::Symlink });
+        } else if ty.is_dir() {
+            walk_dir(&child, &rel, out)?;
+        } else {
+            out.push(Input { path: child, rel, kind: InputKind::File });
+        }
+    }
+    Ok(())
+}
+
+/// Create a symlink at `link` pointing to `target`.
+#[cfg(unix)]
+pub fn create_symlink(target: &str, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn create_symlink(target: &str, link: &Path) -> Result<()> {
+    // Windows has separate file and directory symlinks and needs Developer Mode
+    // (or SeCreateSymbolicLinkPrivilege) for either. We always create a file
+    // link, matching what the tar crate does.
+    std::os::windows::fs::symlink_file(target, link)?;
+    Ok(())
+}
+
+/// Restore a link entry.
+///
+/// A **hard** link's target names a file inside the archive, so it goes through
+/// the guard: an archive claiming `link -> /etc/shadow` must not get one.
+///
+/// A **symlink**'s target is just a string that the OS resolves whenever the
+/// link is used later. Absolute and `..` targets are legal and ordinary there —
+/// packaging tarballs are full of them — so it is stored verbatim, the same as
+/// GNU tar, bsdtar and WinRAR. That is safe because the link cannot be *used* to escape
+/// during extraction: every later entry re-checks its ancestors through
+/// `guard`, which is what closes the `evil -> /tmp` + `evil/owned.txt` attack.
+pub fn unpack_link(
+    guard: &mut DestGuard,
+    is_symlink: bool,
+    target: &str,
+    out_path: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    if target.is_empty() {
+        return Err(Error::corrupt(format!(
+            "{}: link entry with an empty target",
+            out_path.display()
+        )));
+    }
+    prepare_leaf(out_path, overwrite)?;
+    // prepare_leaf only clears a symlink; neither symlink() nor hard_link() can
+    // replace an existing file, so with overwrite the leaf has to go entirely.
+    if overwrite {
+        let _ = std::fs::remove_file(out_path);
+    }
+
+    if is_symlink {
+        create_symlink(target, out_path)?;
+        // This path is a symlink now — it must never be remembered as a
+        // directory that is safe to descend through.
+        guard.forget(out_path);
+    } else {
+        let src = guard.join(target)?;
+        std::fs::hard_link(&src, out_path)?;
+    }
+    Ok(())
+}
+
+/// Create parent directories for a file path about to be written.
+pub fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}

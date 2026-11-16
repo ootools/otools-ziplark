@@ -1,0 +1,902 @@
+use crate::encoding::NameDecoder;
+use crate::error::{Error, Result};
+use crate::formats::{
+    collect_inputs, copy_watched, create_file, create_symlink, ensure_parent, prepare_dir,
+    read_bounded, report, DestGuard, InputKind,
+};
+use crate::model::*;
+use crate::volumes::{VolumeReader, VolumeSet};
+use crate::{CreateOptions, ExtractOptions, Level, ListOptions, ProgressFn, ReadOptions};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{self, Write};
+use std::io::{Read, Seek};
+use std::path::Path;
+use zip::result::ZipError;
+use zip::write::{ExtendedFileOptions, FileOptions};
+use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
+
+/// Unix mode bits: the file-type field, and the value meaning "symlink".
+const S_IFMT: u32 = 0o170000;
+const S_IFLNK: u32 = 0o120000;
+/// ZIP's 32-bit size fields stop here; anything at or past it needs Zip64.
+const ZIP64_THRESHOLD: u64 = u32::MAX as u64;
+/// Header ID of the "extended timestamp" field (see libzip's extrafld.txt).
+const EXTENDED_TIMESTAMP_ID: u16 = 0x5455;
+
+fn map_zip_err(e: ZipError) -> Error {
+    match e {
+        ZipError::Io(e) => Error::Io(e),
+        ZipError::InvalidPassword => Error::BadPassword,
+        ZipError::UnsupportedArchive(msg) if msg.contains("Password") => Error::PasswordRequired,
+        ZipError::UnsupportedArchive(msg) => Error::other(msg.to_string()),
+        ZipError::InvalidArchive(msg) => Error::corrupt(msg.to_string()),
+        other => Error::corrupt(other.to_string()),
+    }
+}
+
+fn ts(dt: Option<zip::DateTime>) -> Option<i64> {
+    dt.and_then(|d| d.try_into().ok())
+        .map(|t: time::OffsetDateTime| t.unix_timestamp())
+}
+
+/// Decode every entry name in the archive.
+///
+/// ZIP only promises UTF-8 when general-purpose bit 11 is set; otherwise the
+/// name is raw bytes in the creating machine's code page, and the `zip` crate's
+/// `name()` reads those as CP437 — which is how `中文文件.txt` becomes
+/// `ÖÐÎÄÎÄ¼þ.txt`. We decode `name_raw()` ourselves instead.
+///
+/// The whole central directory is already in memory once the archive is open,
+/// so every name is sampled before any is decoded: more bytes make the encoding
+/// guess markedly better than judging one short filename at a time.
+fn decode_names<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<String>> {
+    Ok(read_directory(archive)?.0)
+}
+
+/// Decoded entry names plus the archive's total uncompressed size, both read
+/// from the central directory in one pass. The size lets extraction report a
+/// real percentage instead of an endless spinner.
+fn read_directory<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<(Vec<String>, u64)> {
+    let mut raw = Vec::with_capacity(archive.len());
+    let mut total_size = 0u64;
+    for i in 0..archive.len() {
+        let e = archive.by_index_raw(i).map_err(map_zip_err)?;
+        total_size += e.size();
+        raw.push(e.name_raw().to_vec());
+    }
+    let mut decoder = NameDecoder::new();
+    for name in &raw {
+        decoder.sample(name);
+    }
+    Ok((raw.iter().map(|n| decoder.decode(n)).collect(), total_size))
+}
+
+pub fn list(path: &Path, fmt: Format, _opts: &ListOptions) -> Result<ArchiveInfo> {
+    let set = VolumeSet::inspect(path);
+    let reader = match VolumeReader::open_zip(&set) {
+        Ok(r) => r,
+        Err(Error::MissingVolume(missing)) => {
+            let total_compressed = set.total_compressed_size().unwrap_or(0);
+            return Ok(ArchiveInfo {
+                format: fmt,
+                path: set.primary,
+                entries: Vec::new(),
+                encrypted: false,
+                total_size: 0,
+                total_compressed,
+                volumes: set.volumes,
+                missing_volume: Some(missing),
+                comment: None,
+                attributes: ArchiveAttributes::default(),
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let mut archive = ZipArchive::new(reader).map_err(map_zip_err)?;
+    // ZIP keeps a comment at the end of the central directory — usually absent,
+    // free to read when it is there. Its bytes carry no declared encoding, so
+    // anything that is not UTF-8 is read leniently rather than dropped.
+    let comment = Some(String::from_utf8_lossy(archive.comment()).trim().to_string())
+        .filter(|c| !c.is_empty());
+    let names = decode_names(&mut archive)?;
+    let mut entries = Vec::with_capacity(archive.len());
+    let mut total_size = 0u64;
+    let mut total_compressed = 0u64;
+    let mut any_encrypted = false;
+    let is_multi_vol = set.volumes.len() > 1;
+
+    for (i, name) in names.iter().enumerate() {
+        // by_index_raw exposes metadata without needing the password.
+        let e = archive.by_index_raw(i).map_err(map_zip_err)?;
+        let encrypted = e.encrypted();
+        any_encrypted |= encrypted;
+        total_size += e.size();
+        total_compressed += e.compressed_size();
+        entries.push(ArchiveEntry {
+            path: name.clone(),
+            is_dir: e.is_dir(),
+            size: e.size(),
+            compressed_size: Some(e.compressed_size()),
+            encrypted,
+            modified: ts(e.last_modified()),
+            crc32: Some(e.crc32()),
+            split: is_multi_vol,
+        });
+    }
+
+    Ok(ArchiveInfo {
+        format: fmt,
+        path: set.primary,
+        entries,
+        encrypted: any_encrypted,
+        total_size,
+        total_compressed,
+        volumes: set.volumes,
+        missing_volume: set.missing_volume,
+        comment,
+        attributes: ArchiveAttributes::default(),
+    })
+}
+
+pub fn extract(path: &Path, opts: &ExtractOptions, progress: ProgressFn) -> Result<ExtractReport> {
+    let set = VolumeSet::inspect(path);
+    let reader = VolumeReader::open_zip(&set)?;
+    let mut archive = ZipArchive::new(reader).map_err(map_zip_err)?;
+    let (names, bytes_total) = read_directory(&mut archive)?;
+    let selector = opts.selector();
+    let pw = opts.password.as_deref().filter(|p| !p.is_empty());
+
+    if pw.is_none() {
+        for (i, name) in names.iter().enumerate() {
+            if !selector.matches(name) {
+                continue;
+            }
+            let e = archive.by_index_raw(i).map_err(map_zip_err)?;
+            if !e.is_dir() && e.encrypted() {
+                return Err(Error::PasswordRequired);
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&opts.dest)?;
+
+    let total = archive.len() as u64;
+    let mut guard = DestGuard::new(&opts.dest);
+    let mut report = ExtractReport {
+        files_written: 0,
+        dirs_created: 0,
+        bytes_written: 0,
+        dest: opts.dest.clone(),
+        failed: Vec::new(),
+        partial: Vec::new(),
+    };
+
+    for (i, name) in names.iter().enumerate() {
+        if !selector.matches(name) {
+            continue;
+        }
+        let mut entry = match pw {
+            Some(p) => archive.by_index_decrypt(i, p.as_bytes()),
+            None => archive.by_index(i),
+        }
+        .map_err(map_zip_err)?;
+
+        let out_path = guard.join(name)?;
+
+        if entry.is_dir() {
+            prepare_dir(&out_path, name)?;
+            report.dirs_created += 1;
+            continue;
+        }
+
+        ensure_parent(&out_path)?;
+        let mode = entry.unix_mode();
+        let mtime = entry_mtime(&entry);
+
+        // A symlink is stored as a regular entry whose *content* is the target
+        // path, flagged in the unix mode. Writing it out as a file would leave
+        // a text file where the link should be.
+        if mode.is_some_and(|m| m & S_IFMT == S_IFLNK) {
+            let mut target = String::new();
+            entry.read_to_string(&mut target)?;
+            crate::formats::prepare_leaf(&out_path, opts.overwrite)?;
+            if opts.overwrite {
+                let _ = std::fs::remove_file(&out_path);
+            }
+            create_symlink(&target, &out_path)?;
+            guard.forget(&out_path);
+            report.files_written += 1;
+            crate::formats::report(
+                progress,
+                Progress {
+                    current_path: name.clone(),
+                    entries_done: i as u64 + 1,
+                    entries_total: total,
+                    bytes_done: report.bytes_written,
+                    bytes_total,
+                },
+            )?;
+            continue;
+        }
+
+        let entry_encrypted = entry.encrypted();
+        let mut out = create_file(&out_path, opts.overwrite)?;
+        let done_before = report.bytes_written;
+        let copied = copy_watched(&mut entry, &mut out, |so_far| {
+            progress(Progress {
+                current_path: name.clone(),
+                entries_done: i as u64 + 1,
+                entries_total: total,
+                bytes_done: done_before + so_far,
+                bytes_total,
+            })
+        });
+        drop(out);
+        let n = match copied {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                if entry_encrypted
+                    && pw.is_some()
+                    && matches!(&e, Error::Io(io_err) if io_err.kind() == io::ErrorKind::InvalidData)
+                {
+                    return Err(Error::BadPassword);
+                }
+                return Err(e);
+            }
+        };
+        restore_metadata(&out_path, mode, mtime);
+        report.files_written += 1;
+        report.bytes_written += n;
+    }
+    Ok(report)
+}
+
+pub fn test(path: &Path, opts: &ListOptions, progress: ProgressFn) -> Result<TestReport> {
+    let set = VolumeSet::inspect(path);
+    let reader = VolumeReader::open_zip(&set)?;
+    let mut archive = ZipArchive::new(reader).map_err(map_zip_err)?;
+    let names = decode_names(&mut archive)?;
+    let total = archive.len() as u64;
+    let pw = opts.password.as_deref().filter(|p| !p.is_empty());
+    let mut bad = Vec::new();
+    let mut tested = 0u64;
+    let mut sink = io::sink();
+
+    for (i, name) in names.iter().enumerate() {
+        let res = match pw {
+            Some(p) => archive.by_index_decrypt(i, p.as_bytes()),
+            None => archive.by_index(i),
+        };
+        let mut entry = match res {
+            Ok(e) => e,
+            Err(e) => match map_zip_err(e) {
+                err @ (Error::PasswordRequired | Error::BadPassword) => return Err(err),
+                other => {
+                    bad.push(format!("entry #{i}: {other}"));
+                    continue;
+                }
+            },
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let entry_encrypted = entry.encrypted();
+        tested += 1;
+        // Reading to EOF makes the zip crate verify the CRC32 / AES HMAC.
+        if let Err(e) = io::copy(&mut entry, &mut sink) {
+            if entry_encrypted && pw.is_some() && e.kind() == io::ErrorKind::InvalidData {
+                return Err(Error::BadPassword);
+            }
+            bad.push(format!("{name}: {e}"));
+        }
+        report(
+            progress,
+            Progress {
+                current_path: name.clone(),
+                entries_done: i as u64 + 1,
+                entries_total: total,
+                bytes_done: 0,
+                bytes_total: 0,
+            },
+        )?;
+    }
+    Ok(TestReport {
+        ok: bad.is_empty(),
+        entries_tested: tested,
+        bad_entries: bad,
+    })
+}
+
+/// The entry's modification time as unix seconds.
+///
+/// The base ZIP header stores an MS-DOS timestamp: two-second resolution, no
+/// time zone, and nothing before 1980. The 0x5455 "extended timestamp" extra
+/// field carries real UTC unix time, so prefer it whenever a writer left one.
+fn entry_mtime(entry: &zip::read::ZipFile<'_>) -> Option<i64> {
+    for field in entry.extra_data_fields() {
+        if let zip::extra_fields::ExtraField::ExtendedTimestamp(ts) = field {
+            if let Some(secs) = ts.mod_time() {
+                return Some(secs as i64);
+            }
+        }
+    }
+    ts(entry.last_modified())
+}
+
+/// Put back what the archive recorded. Best-effort: a mode we cannot apply (or
+/// a filesystem that does not have one) is not a reason to fail an extraction.
+fn restore_metadata(path: &Path, mode: Option<u32>, mtime: Option<i64>) {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    if let Some(secs) = mtime {
+        let t = filetime::FileTime::from_unix_time(secs, 0);
+        let _ = filetime::set_file_times(path, t, t);
+    }
+}
+
+/// This file's permission bits, as ZIP records them.
+#[cfg(unix)]
+fn permissions_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+/// Windows has no unix mode; keep the executable bit off and honour read-only.
+#[cfg(not(unix))]
+fn permissions_of(meta: &std::fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o644
+    }
+}
+
+fn unix_seconds(t: std::time::SystemTime) -> Option<i64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
+/// Per-entry write options carrying the file's real permissions and timestamp.
+fn entry_options<'a>(
+    opts: &'a CreateOptions,
+    meta: Option<&std::fs::Metadata>,
+    mode_override: Option<u32>,
+) -> Result<FileOptions<'a, ExtendedFileOptions>> {
+    let level = match opts.level {
+        Level::Store => None,
+        Level::Fast => Some(1),
+        Level::Default => Some(6),
+        Level::Best => Some(9),
+    };
+    let method = if matches!(opts.level, Level::Store) {
+        CompressionMethod::Stored
+    } else {
+        CompressionMethod::Deflated
+    };
+
+    let mode = mode_override
+        .or_else(|| meta.map(permissions_of))
+        .unwrap_or(0o644);
+    let mut o = FileOptions::<ExtendedFileOptions>::default()
+        .compression_method(method)
+        .compression_level(level)
+        .unix_permissions(mode)
+        // Without this, the writer refuses any entry that crosses 4 GiB.
+        .large_file(meta.is_some_and(|m| m.len() >= ZIP64_THRESHOLD));
+
+    if let Some(modified) = meta.and_then(|m| m.modified().ok()) {
+        let odt = time::OffsetDateTime::from(modified);
+        if let Ok(dt) = zip::DateTime::try_from(odt) {
+            o = o.last_modified_time(dt);
+        }
+        if let Some(secs) = unix_seconds(modified) {
+            // flags byte (bit 0 = modification time present), then unix time.
+            let mut data = Vec::with_capacity(5);
+            data.push(0b0000_0001);
+            data.extend_from_slice(&(secs as i32).to_le_bytes());
+            o.add_extra_data(EXTENDED_TIMESTAMP_ID, data.into_boxed_slice(), false)
+                .map_err(map_zip_err)?;
+        }
+    }
+
+    if let Some(pw) = &opts.password {
+        o = o.with_aes_encryption(AesMode::Aes256, pw);
+    }
+    Ok(o)
+}
+
+pub fn create(
+    output: &Path,
+    inputs: &[std::path::PathBuf],
+    opts: &CreateOptions,
+    progress: ProgressFn,
+) -> Result<CreateReport> {
+    let files = collect_inputs(inputs)?;
+    let out = File::create(output)?;
+    let mut zipw = ZipWriter::new(out);
+
+    let total = files.len() as u64;
+    let mut report = CreateReport {
+        output: output.to_path_buf(),
+        format: Format::Zip,
+        entries_added: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        volumes: Vec::new(),
+    };
+
+    for (idx, input) in files.iter().enumerate() {
+        match input.kind {
+            InputKind::EmptyDir => {
+                let meta = std::fs::metadata(&input.path).ok();
+                let o = entry_options(opts, meta.as_ref(), None)?;
+                zipw.add_directory(input.rel.trim_end_matches('/'), o)
+                    .map_err(map_zip_err)?;
+            }
+            InputKind::Symlink => {
+                let target = std::fs::read_link(&input.path)?;
+                let meta = std::fs::symlink_metadata(&input.path).ok();
+                // 0o777 on a symlink is conventional; the type bits are what
+                // actually mark it, and readers key off those.
+                let o = entry_options(opts, meta.as_ref(), Some(S_IFLNK | 0o777))?;
+                zipw.add_symlink(
+                    input.rel.as_str(),
+                    target.to_string_lossy().replace('\\', "/"),
+                    o,
+                )
+                .map_err(map_zip_err)?;
+                report.entries_added += 1;
+            }
+            InputKind::File => {
+                let meta = std::fs::metadata(&input.path)?;
+                let o = entry_options(opts, Some(&meta), None)?;
+                zipw.start_file(input.rel.as_str(), o).map_err(map_zip_err)?;
+                let mut f = File::open(&input.path)?;
+                let n = io::copy(&mut f, &mut zipw)?;
+                report.entries_added += 1;
+                report.bytes_in += n;
+            }
+        }
+        crate::formats::report(
+            progress,
+            Progress {
+                current_path: input.rel.clone(),
+                entries_done: idx as u64 + 1,
+                entries_total: total,
+                bytes_done: report.bytes_in,
+                bytes_total: 0,
+            },
+        )?;
+    }
+
+    let mut finished = zipw.finish().map_err(map_zip_err)?;
+    finished.flush()?;
+    report.bytes_out = finished.metadata()?.len();
+    Ok(report)
+}
+
+pub fn read_entry(path: &Path, entry_path: &str, opts: &ReadOptions) -> Result<EntryContent> {
+    let set = VolumeSet::inspect(path);
+    let reader = VolumeReader::open_zip(&set)?;
+    let mut archive = ZipArchive::new(reader).map_err(map_zip_err)?;
+    let names = decode_names(&mut archive)?;
+    let target = entry_path.replace('\\', "/");
+    let target = target.trim_start_matches("./").trim_end_matches('/');
+
+    let pw = opts.password.as_deref().filter(|p| !p.is_empty());
+
+    for (i, name) in names.iter().enumerate() {
+        if name.trim_end_matches('/') == target {
+            let mut entry = match pw {
+                Some(p) => archive.by_index_decrypt(i, p.as_bytes()),
+                None => archive.by_index(i),
+            }
+            .map_err(map_zip_err)?;
+            let entry_encrypted = entry.encrypted();
+            let size = entry.size();
+            return read_bounded(&mut entry, name.clone(), size, opts).map_err(|e| {
+                if entry_encrypted
+                    && pw.is_some()
+                    && matches!(&e, Error::Io(io_err) if io_err.kind() == io::ErrorKind::InvalidData)
+                {
+                    Error::BadPassword
+                } else {
+                    e
+                }
+            });
+        }
+    }
+    Err(Error::other(format!("entry not found in archive: {entry_path}")))
+}
+
+/// Add (or replace) `inputs` inside an existing ZIP archive atomically.
+/// Existing entries that are not overwritten by `inputs` are copied raw without
+/// decompression/recompression.
+pub fn add(
+    archive_path: &Path,
+    inputs: &[std::path::PathBuf],
+    opts: &CreateOptions,
+    progress: ProgressFn,
+) -> Result<CreateReport> {
+    let files = collect_inputs(inputs)?;
+    let new_names: HashSet<String> = files
+        .iter()
+        .map(|f| f.rel.trim_end_matches('/').to_string())
+        .collect();
+
+    let src_file = File::open(archive_path)?;
+    let mut existing = ZipArchive::new(src_file).map_err(map_zip_err)?;
+    let existing_names = decode_names(&mut existing)?;
+    let comment = existing.comment().to_vec();
+
+    let (tmp_path, tmp_file) = create_temp_for(archive_path, "zip.tmp")?;
+    let mut zipw = ZipWriter::new(tmp_file);
+    if !comment.is_empty() {
+        zipw.set_raw_comment(comment.into_boxed_slice());
+    }
+
+    let mut report = CreateReport {
+        output: archive_path.to_path_buf(),
+        format: Format::Zip,
+        entries_added: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        volumes: Vec::new(),
+    };
+
+    let copy_res = (|| -> Result<()> {
+        for (i, name) in existing_names.iter().enumerate() {
+            let clean = name.trim_end_matches('/');
+            if new_names.contains(clean) {
+                continue;
+            }
+            let raw_entry = existing.by_index_raw(i).map_err(map_zip_err)?;
+            zipw.raw_copy_file(raw_entry).map_err(map_zip_err)?;
+        }
+
+        let total = files.len() as u64;
+        for (idx, input) in files.iter().enumerate() {
+            match input.kind {
+                InputKind::EmptyDir => {
+                    let meta = std::fs::metadata(&input.path).ok();
+                    let o = entry_options(opts, meta.as_ref(), None)?;
+                    zipw.add_directory(input.rel.trim_end_matches('/'), o)
+                        .map_err(map_zip_err)?;
+                }
+                InputKind::Symlink => {
+                    let target = std::fs::read_link(&input.path)?;
+                    let meta = std::fs::symlink_metadata(&input.path).ok();
+                    let o = entry_options(opts, meta.as_ref(), Some(S_IFLNK | 0o777))?;
+                    zipw.add_symlink(
+                        input.rel.as_str(),
+                        target.to_string_lossy().replace('\\', "/"),
+                        o,
+                    )
+                    .map_err(map_zip_err)?;
+                    report.entries_added += 1;
+                }
+                InputKind::File => {
+                    let meta = std::fs::metadata(&input.path)?;
+                    let o = entry_options(opts, Some(&meta), None)?;
+                    zipw.start_file(input.rel.as_str(), o).map_err(map_zip_err)?;
+                    let mut f = File::open(&input.path)?;
+                    let n = io::copy(&mut f, &mut zipw)?;
+                    report.entries_added += 1;
+                    report.bytes_in += n;
+                }
+            }
+            crate::formats::report(
+                progress,
+                Progress {
+                    current_path: input.rel.clone(),
+                    entries_done: idx as u64 + 1,
+                    entries_total: total,
+                    bytes_done: report.bytes_in,
+                    bytes_total: 0,
+                },
+            )?;
+        }
+
+        let mut finished = zipw.finish().map_err(map_zip_err)?;
+        finished.flush()?;
+        Ok(())
+    })();
+
+    drop(existing);
+    if let Err(e) = copy_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    replace_archive_file(&tmp_path, archive_path)?;
+    report.bytes_out = std::fs::metadata(archive_path)?.len();
+    Ok(report)
+}
+
+/// Remove entries matching `selector` from an existing ZIP archive atomically,
+/// copying remaining entries raw without decompression or recompression.
+pub fn remove(
+    archive_path: &Path,
+    selector: &crate::Selector,
+    progress: ProgressFn,
+) -> Result<RemoveReport> {
+    if selector.matches_everything() {
+        return Err(Error::other(
+            "refusing to remove entries without at least one pattern",
+        ));
+    }
+
+    let src_file = File::open(archive_path)?;
+    let mut existing = ZipArchive::new(src_file).map_err(map_zip_err)?;
+    let existing_names = decode_names(&mut existing)?;
+    let comment = existing.comment().to_vec();
+
+    let total = existing_names.len() as u64;
+    let will_remove = existing_names
+        .iter()
+        .filter(|name| selector.matches(name))
+        .count() as u64;
+
+    if will_remove == 0 {
+        let bytes_out = std::fs::metadata(archive_path)?.len();
+        return Ok(RemoveReport {
+            output: archive_path.to_path_buf(),
+            format: Format::Zip,
+            entries_removed: 0,
+            entries_remaining: total,
+            bytes_out,
+        });
+    }
+
+    let (tmp_path, tmp_file) = create_temp_for(archive_path, "zip.rm.tmp")?;
+    let mut zipw = ZipWriter::new(tmp_file);
+    if !comment.is_empty() {
+        zipw.set_raw_comment(comment.into_boxed_slice());
+    }
+
+    let mut entries_removed = 0u64;
+    let mut entries_remaining = 0u64;
+
+    let copy_res = (|| -> Result<()> {
+        for (i, name) in existing_names.iter().enumerate() {
+            if selector.matches(name) {
+                entries_removed += 1;
+            } else {
+                let raw_entry = existing.by_index_raw(i).map_err(map_zip_err)?;
+                zipw.raw_copy_file(raw_entry).map_err(map_zip_err)?;
+                entries_remaining += 1;
+            }
+            crate::formats::report(
+                progress,
+                Progress {
+                    current_path: name.clone(),
+                    entries_done: i as u64 + 1,
+                    entries_total: total,
+                    bytes_done: 0,
+                    bytes_total: 0,
+                },
+            )?;
+        }
+
+        let mut finished = zipw.finish().map_err(map_zip_err)?;
+        finished.flush()?;
+        Ok(())
+    })();
+
+    drop(existing);
+    if let Err(e) = copy_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    replace_archive_file(&tmp_path, archive_path)?;
+    let bytes_out = std::fs::metadata(archive_path)?.len();
+    Ok(RemoveReport {
+        output: archive_path.to_path_buf(),
+        format: Format::Zip,
+        entries_removed,
+        entries_remaining,
+        bytes_out,
+    })
+}
+
+/// Rename `from` (or all entries under `from/`) to `to` inside an existing ZIP
+/// archive atomically, copying compressed streams directly without recompression.
+pub fn rename(
+    archive_path: &Path,
+    from: &str,
+    to: &str,
+    progress: ProgressFn,
+) -> Result<RenameReport> {
+    let from_clean = from.replace('\\', "/");
+    let from_clean = from_clean.trim_start_matches("./").trim_matches('/');
+    let to_clean = to.replace('\\', "/");
+    let to_clean = to_clean.trim_start_matches("./").trim_matches('/');
+    if from_clean.is_empty() || to_clean.is_empty() {
+        return Err(Error::other("rename source and destination paths must not be empty"));
+    }
+
+    let src_file = File::open(archive_path)?;
+    let mut existing = ZipArchive::new(src_file).map_err(map_zip_err)?;
+    let existing_names = decode_names(&mut existing)?;
+    let comment = existing.comment().to_vec();
+
+    let from_prefix = format!("{from_clean}/");
+    let total = existing_names.len() as u64;
+    let will_rename = existing_names
+        .iter()
+        .filter(|name| {
+            let trimmed = name.trim_start_matches("./").trim_end_matches('/');
+            trimmed == from_clean || trimmed.starts_with(&from_prefix)
+        })
+        .count() as u64;
+
+    if will_rename == 0 {
+        return Err(Error::other(format!("entry not found in archive: {from_clean}")));
+    }
+
+    let (tmp_path, tmp_file) = create_temp_for(archive_path, "zip.mv.tmp")?;
+    let mut zipw = ZipWriter::new(tmp_file);
+    if !comment.is_empty() {
+        zipw.set_raw_comment(comment.into_boxed_slice());
+    }
+
+    let mut entries_renamed = 0u64;
+
+    let copy_res = (|| -> Result<()> {
+        for (i, name) in existing_names.iter().enumerate() {
+            let is_dir_slash = name.ends_with('/');
+            let trimmed = name.trim_start_matches("./").trim_end_matches('/');
+            let new_name = if trimmed == from_clean {
+                entries_renamed += 1;
+                if is_dir_slash {
+                    Some(format!("{to_clean}/"))
+                } else {
+                    Some(to_clean.to_string())
+                }
+            } else if let Some(rest) = trimmed.strip_prefix(&from_prefix) {
+                entries_renamed += 1;
+                if is_dir_slash {
+                    Some(format!("{to_clean}/{rest}/"))
+                } else {
+                    Some(format!("{to_clean}/{rest}"))
+                }
+            } else {
+                None
+            };
+
+            let raw_entry = existing.by_index_raw(i).map_err(map_zip_err)?;
+            if let Some(renamed) = new_name {
+                zipw.raw_copy_file_rename(raw_entry, renamed)
+                    .map_err(map_zip_err)?;
+            } else {
+                zipw.raw_copy_file(raw_entry).map_err(map_zip_err)?;
+            }
+
+            crate::formats::report(
+                progress,
+                Progress {
+                    current_path: name.clone(),
+                    entries_done: i as u64 + 1,
+                    entries_total: total,
+                    bytes_done: 0,
+                    bytes_total: 0,
+                },
+            )?;
+        }
+
+        let mut finished = zipw.finish().map_err(map_zip_err)?;
+        finished.flush()?;
+        Ok(())
+    })();
+
+    drop(existing);
+    if let Err(e) = copy_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    replace_archive_file(&tmp_path, archive_path)?;
+    let bytes_out = std::fs::metadata(archive_path)?.len();
+    Ok(RenameReport {
+        output: archive_path.to_path_buf(),
+        format: Format::Zip,
+        from: from_clean.to_string(),
+        to: to_clean.to_string(),
+        entries_renamed,
+        bytes_out,
+    })
+}
+
+/// Create a temporary file alongside `target` when its parent directory is
+/// writable, or fall back to `std::env::temp_dir()` (e.g. inside the macOS
+/// App Sandbox where only `target` itself was granted access by Powerbox).
+pub(crate) fn create_temp_for(target: &Path, tag: &str) -> Result<(std::path::PathBuf, File)> {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let sibling = target.with_extension(format!("{tag}.{pid}.{nanos}"));
+    if let Ok(f) = File::create(&sibling) {
+        return Ok((sibling, f));
+    }
+    let fallback = std::env::temp_dir().join(format!("ziplark-{tag}-{pid}-{nanos}.tmp"));
+    let f = File::create(&fallback)?;
+    Ok((fallback, f))
+}
+
+/// Atomically replace `dst` with `tmp` when in the same writable directory, or
+/// copy `tmp` over `dst` in place when `dst` is on another filesystem or inside
+/// a sandboxed directory where only `dst` itself is writable.
+pub(crate) fn replace_archive_file(tmp: &Path, dst: &Path) -> Result<()> {
+    if std::fs::rename(tmp, dst).is_ok() {
+        return Ok(());
+    }
+    let copy_res = std::fs::copy(tmp, dst);
+    let _ = std::fs::remove_file(tmp);
+    copy_res?;
+    Ok(())
+}
+
+/// Stream every matching regular file in the ZIP archive through `on_file` in a
+/// single pass without touching disk. Returning `Ok(false)` stops early.
+pub fn scan_files(
+    path: &Path,
+    password: &Option<String>,
+    selector: &crate::Selector,
+    max_file_size: u64,
+    mut on_file: impl FnMut(&str, u64, &mut dyn Read) -> Result<bool>,
+) -> Result<()> {
+    let set = VolumeSet::inspect(path);
+    let reader = VolumeReader::open_zip(&set)?;
+    let mut archive = ZipArchive::new(reader).map_err(map_zip_err)?;
+    let names = decode_names(&mut archive)?;
+
+    let pw = password.as_deref().filter(|p| !p.is_empty());
+
+    for (i, name) in names.iter().enumerate() {
+        if name.ends_with('/') || !selector.matches(name) {
+            continue;
+        }
+        let mut entry = match pw {
+            Some(p) => archive.by_index_decrypt(i, p.as_bytes()),
+            None => archive.by_index(i),
+        }
+        .map_err(map_zip_err)?;
+        if entry.is_dir() || entry.is_symlink() {
+            continue;
+        }
+        let entry_encrypted = entry.encrypted();
+        let size = entry.size();
+        if size == 0 || size > max_file_size {
+            continue;
+        }
+        let ok = on_file(name, size, &mut entry).map_err(|e| {
+            if entry_encrypted
+                && pw.is_some()
+                && matches!(&e, Error::Io(io_err) if io_err.kind() == io::ErrorKind::InvalidData)
+            {
+                Error::BadPassword
+            } else {
+                e
+            }
+        })?;
+        if !ok {
+            break;
+        }
+    }
+    Ok(())
+}
+
+
+

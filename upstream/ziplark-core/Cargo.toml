@@ -1,0 +1,80 @@
+[package]
+name = "ziplark-core"
+description = "Free, fast, cross-platform archive engine (extract & create). Shared core for the Ziplark GUI, CLI and MCP server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["archive", "zip", "compression", "rar", "tar"]
+categories = ["compression", "filesystem"]
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# ZIP: read + write, AES-256, deflate, bzip2, zstd, lzma
+zip = { version = "2.2", default-features = false, features = ["aes-crypto", "deflate", "bzip2", "zstd", "lzma", "time"] }
+# tar (uncompressed container)
+tar = "0.4"
+# gzip / deflate streams
+flate2 = "1"
+# bzip2 streams
+bzip2 = "0.4"
+# xz / lzma streams
+xz2 = "0.1"
+# zstd standalone streams (.zst)
+zstd = "0.13"
+# timestamp conversion (re-uses the copy already pulled in by zip's `time` feature)
+time = { version = "0.3", default-features = false }
+# 7z: pure-Rust read + write. `compress` enables the encoder (incl. the
+# multi-threaded LZMA2 one); the codec features let us open .7z archives that
+# were written with something other than LZMA2 — bzip2/deflate/lz4/zstd reuse
+# crates we already link for the tar variants, so they cost almost nothing.
+sevenz-rust2 = { version = "0.22", default-features = false, features = [
+    "compress", "aes256", "bzip2", "deflate", "lz4", "zstd", "ppmd",
+] }
+# RAR (incl. RAR5) extraction: the bundled libunrar itself, driven directly.
+# Extract-only — creating RAR is proprietary. `formats/rar/raw.rs` explains why
+# we bind the C API instead of using the `unrar` wrapper crate (multi-volume
+# archives read out of bounds there, a failed entry destroys the handle, and its
+# struct layouts do not match the library's packed headers).
+unrar_sys = "0.5"
+# Wide strings for that C API — libunrar takes paths as wchar_t off Linux.
+widestring = "1"
+# Restoring file modification times on extract (already in the tree via tar)
+filetime = "0.2"
+# LZ4 frame format (.lz4 / .tar.lz4) — pure Rust, read + write
+lz4_flex = "0.11"
+# Legacy filename decoding. ZIP and tar store raw bytes in the creating
+# machine's code page (CP936/CP932/CP949/CP950 on CJK Windows); chardetng
+# guesses which one, encoding_rs decodes it. Both are pure Rust, no C.
+chardetng = "0.1"
+encoding_rs = "0.8"
+# Cryptographic & fast checksums (`ziplark hash`, `ziplark diff`, XAR verification).
+# All three are already in Cargo.lock via zip / sevenz-rust2 / flate2.
+sha2 = "0.10"
+sha1 = "0.10"
+crc32fast = "1"
+
+# sysctl hw.memsize: a RAR 7 entry can need tens of gigabytes of dictionary to
+# unpack, and how much this machine has decides whether we let it try.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# GetACP(), so a legacy ZIP opened on the localized Windows that made it decodes
+# with that machine's code page when the name is too short to detect; and
+# GlobalMemoryStatusEx, for the same dictionary decision as above.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Globalization",
+    "Win32_System_SystemInformation",
+    # GlobalMemoryStatusEx returns a Foundation::BOOL, and Win32_System_*
+    # features do not pull Foundation in by themselves.
+    "Win32_Foundation",
+] }
+
+[features]
+default = []

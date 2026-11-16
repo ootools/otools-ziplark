@@ -1,0 +1,37 @@
+OTools Ziplark Plugin
+=====================
+
+This repository is a port of Ziplark (https://github.com/zhitongblog/ziplark),
+MIT License, Copyright (c) 2026 doaipm. The upstream snapshot was taken at
+commit 9d539b6 ("fix: prompt for password on data-encrypted RAR/ZIP/7z
+archives") and is preserved verbatim under upstream/.
+
+What was ported
+---------------
+* upstream/ui/                     the vanilla HTML/CSS/JS desktop frontend,
+                                   used without a single source modification.
+* upstream/ziplark-core/           the Rust archive engine, used unmodified as
+                                   the source of native/ziplark-core/.
+* upstream/tauri-commands.reference.rs
+                                   the upstream Tauri command layer, kept only
+                                   as a behavioural reference for native/src/.
+
+What is new in this repository
+------------------------------
+* native/                          OTools cdylib plugin backend. Exposes
+                                   otools_plugin_invoke / otools_plugin_free
+                                   and the optional poll_events channel.
+* shell/                           the OTools host bridge (native invoke,
+                                   SDK file picker, drag & drop, open-file).
+* scripts/, .github/workflows/     build, packaging and release tooling.
+
+Third-party components keep their own licenses. In particular RAR extraction
+uses the UnRAR library, which is NOT MIT licensed and may not be used to
+re-create the RAR compression algorithm. See THIRD_PARTY_NOTICES.md.
+
+The OTools host SDK (vendor/otools-plugin-sdk-dist/) and the FFI helper
+(vendor/ot-plugin-ffi/) come from the OTools project and retain their own
+licenses.
+
+Ziplark is a trademark of its respective owner. This port is an independent,
+unofficial plugin and is not endorsed by the upstream author.

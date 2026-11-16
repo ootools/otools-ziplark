@@ -1,0 +1,245 @@
+<div align="center">
+
+<a href="https://ziplark.com"><img src="assets/banner.png" alt="Ziplark — every archive, one small app" width="640" /></a>
+
+[![CI](https://github.com/zhitongblog/ziplark/actions/workflows/ci.yml/badge.svg)](https://github.com/zhitongblog/ziplark/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/zhitongblog/ziplark?color=6366f1)](https://github.com/zhitongblog/ziplark/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/zhitongblog/ziplark/total?color=6366f1)](https://github.com/zhitongblog/ziplark/releases)
+[![Stars](https://img.shields.io/github/stars/zhitongblog/ziplark?style=flat&color=6366f1)](https://github.com/zhitongblog/ziplark/stargazers)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Website](https://img.shields.io/badge/ziplark.com-6366f1?logo=safari&logoColor=white)](https://ziplark.com)
+
+**Free, fast, cross-platform archiver.** Extracts ZIP, RAR (incl. RAR5), 7z,
+tar, ISO and the common compressed-tar variants; creates ZIP (with AES-256), 7z
+and tar archives. One small Rust engine, three ways to drive it: a desktop app,
+a CLI, and an MCP server.
+
+[**Download**](https://ziplark.com/#download) · [Website](https://ziplark.com) · [by doaipm](https://doaipm.com) · [Report a bug](https://github.com/zhitongblog/ziplark/issues)
+
+</div>
+
+## Install
+
+```bash
+# macOS — Homebrew
+brew install --cask zhitongblog/tap/ziplark   # desktop app
+brew install zhitongblog/tap/ziplark          # CLI + MCP (ziplark, ziplark-mcp)
+```
+
+```powershell
+# Windows — Scoop (CLI + MCP)
+scoop bucket add ziplark https://github.com/zhitongblog/scoop-bucket
+scoop install ziplark
+```
+
+Or grab a build for any platform from the [releases page](https://github.com/zhitongblog/ziplark/releases/latest)
+(macOS `.dmg`, Windows `.msi`/`.exe`, Linux `.deb`/`.AppImage`, and CLI archives).
+
+| | Read / Extract / Preview | Create / Append | Encryption |
+|---|:---:|:---:|---|
+| ZIP (incl. `.zip.001`, `.z01`+`.zip`, `.jar`, `.apk`, `.ipa`, `.whl`, `.nupkg`, `.crx`, `.epub`, `.docx`, `.cbz`) | ✅ | ✅ | AES-256 (read ZipCrypto) |
+| 7z (incl. `.7z.001` multi-volume, `.cb7`) | ✅ | ✅ | AES-256 |
+| RAR / RAR5 (incl. multi-volume, SFX, `.cbr`) | ✅ | — | reads encrypted, incl. encrypted headers |
+| tar (`.tar`, `.cbt`) | ✅ | ✅ | — |
+| tar.gz / .bz2 / .xz / .zst / .lz4 | ✅ | ✅ | — |
+| gz / bz2 / xz / zst / lz4 (single stream) | ✅ | ✅ (create) | — |
+| ISO 9660 / Joliet (`.iso`) | ✅ | — | — |
+| Debian & Unix `ar` (`.deb`, `.udeb`, `.ipk`, `.ar`, `.a`) | ✅ | — | — |
+| RPM & CPIO (`.rpm`, `.cpio`, `.cpio.gz/.xz/.zst/.bz2/.lz4`) | ✅ | — | — |
+| macOS Installer & XAR (`.pkg`, `.mpkg`, `.xar`, `.xip`) | ✅ | — | — |
+| Microsoft Cabinet (`.cab`, Store + MSZIP) | ✅ | — | — |
+
+> RAR, ISO, DEB/AR, RPM/CPIO, PKG/XAR and CAB are read/extract/preview formats — all
+> parsed in memory-safe Rust (except RAR, which uses the official UnRAR C++
+> library). ZIP, 7z and tar variants support full creation (including `--split <SIZE>`
+> multi-volume `.001`, `.002`, … output) and in-place modification (`add`, `mv`, `rm`).
+
+## RAR, properly
+
+RAR is the format people *arrive* with — a download split into volumes, packed
+solid, sometimes one volume short — so it gets first-class treatment rather than
+a checkbox:
+
+- **A volume set is one archive.** `movie.part03.rar`, or the older
+  `movie.r01`, opens the whole set: any file of the set resolves to the first
+  volume, the parts are listed, and an entry that spans volumes comes out whole.
+  Both naming schemes are handled, including the legacy one whose first volume
+  is `movie.rar` rather than `movie.r01`.
+- **A missing volume is named.** Ziplark says *which* file it needs next
+  instead of failing with a generic error, and refuses to start writing rather
+  than stopping half-way.
+- **Damage is survivable.** `--keep-broken` (in the app: "Extract what's
+  readable") gets every intact file out of a damaged or incomplete archive and
+  reports exactly which entries failed and which were written incomplete.
+  Verifying reports *every* bad entry, so you know which file to re-download.
+- **Verifying writes nothing.** Integrity is checked by decompressing each entry
+  and discarding the bytes — not, as a surprising number of tools do, by
+  extracting the whole archive to a temporary directory.
+- **Metadata survives.** Permissions (an executable stays executable),
+  100-nanosecond RAR5 timestamps, symlinks as symlinks, per-entry compressed
+  sizes, solid/recovery-record/lock flags, and the archive comment.
+- **Encrypted headers work.** An archive whose *file names* are encrypted
+  (`rar -hp`) lists and extracts with a password like any other.
+- **Self-extracting archives open.** A `.exe` with a RAR payload behind the stub
+  is read as the archive it is.
+- **Pick single files out of it.** `--exact` (and ticking rows in the app)
+  extracts exactly the entries you name, rather than everything whose path
+  happens to contain the text.
+
+Ziplark drives libunrar's C API directly — see
+[`formats/rar/raw.rs`](crates/ziplark-core/src/formats/rar/raw.rs) for why the
+wrapper crates were not enough (multi-volume reads out of bounds there, a failed
+entry throws away the archive handle, and the struct layouts do not match the
+library's packed headers, which silently mis-reads every field past `file_attr`).
+
+## Why Ziplark
+- **Small.** Size-optimized release profile (`opt-level=z`, LTO, stripped,
+  `panic=abort`). The desktop app uses the OS webview (no bundled Chromium).
+- **Faithful.** Permissions, modification times and symlinks survive the round
+  trip, so an extracted binary still runs and an extracted tree still looks like
+  the one you archived.
+- **Safe.** Every extraction path is funneled through a single guard, and it
+  checks both ways out: the entry name (`../`, absolute paths) *and* what is
+  actually on disk, so a symlink — planted by an earlier entry of the same
+  archive or sitting in the destination already — can't be used to redirect a
+  write. No entry can escape the destination directory.
+- **One engine.** The GUI, CLI and MCP server are thin shells over
+  [`ziplark-core`](crates/ziplark-core); whatever the CLI does, the app does
+  identically.
+
+## Repository layout
+```
+crates/ziplark-core   the archive engine (all formats, the security guard)
+crates/ziplark-cli    the `ziplark` command-line tool
+crates/ziplark-mcp    the MCP server (drive Ziplark from any LLM)
+src-tauri           the Tauri 2 desktop app (Rust commands)
+ui                  the desktop frontend (vanilla HTML/CSS/JS)
+```
+
+## 1. Desktop app
+
+```bash
+# dev run (opens the window)
+cargo tauri dev            # or: cargo run -p ziplark-gui
+
+# build a release .app + .dmg (macOS), .exe/.msi (Windows), AppImage/deb (Linux)
+cargo tauri build
+```
+Drag an archive onto the window to inspect & extract it, or switch to **Create**
+to drag in files/folders, pick a format + compression level (and optional
+password), and save.
+
+## 2. CLI — `ziplark`
+
+```bash
+cargo build --release -p ziplark-cli      # binary at target/release/ziplark
+
+ziplark list    movie.rar
+ziplark cat     repo.tar.gz src/main.rs
+ziplark grep    "TODO" repo.tar.gz -i --include "*.rs"
+ziplark diff    v1.zip v2.tar.zst -u
+ziplark hash    release.pkg --algo sha256
+ziplark extract photos.zip -o ./out --smart
+ziplark create  backup.tar.zst ./src ./README.md --level best --split 100M
+ziplark add     backup.tar.zst ./CHANGELOG.md
+ziplark mv      backup.tar.zst CHANGELOG.md docs/CHANGELOG.md
+ziplark rm      backup.tar.zst docs/CHANGELOG.md --exact
+ziplark convert legacy.rar clean.tar.zst --level best
+ziplark create  secret.zip ./private --password hunter2
+ziplark test    download.7z
+ziplark info    mystery.bin
+```
+Every command takes `--json` for scripting. `--include <PAT>` filters entries on
+extract; `--smart` avoids tarbombs and double-nesting; `--level store|fast|default|best`
+and `--password` apply to create/add.
+
+### Right-click (file-manager) integration
+
+Add **Extract here with Ziplark** and **Compress to ZIP with Ziplark** to your
+OS file manager's context menu:
+
+```bash
+ziplark shell-integration install      # enable
+ziplark shell-integration status       # show what's installed
+ziplark shell-integration uninstall    # remove
+```
+
+Per platform: **macOS** installs two Automator Quick Actions (Finder → right-click →
+Quick Actions); **Windows** adds per-user (`HKCU`, no admin) shell verbs on archive
+file types and on files/folders; **Linux** installs KDE service menus and Nautilus
+scripts. Every entry just calls the `ziplark` CLI (`extract-here` / `compress-zip`),
+so it follows wherever the binary lives. Both helper commands are also usable
+directly:
+
+```bash
+ziplark extract-here movie.zip         # → ./movie/ next to the archive
+ziplark compress-zip ./photos ./a.txt  # → ./Archive.zip next to them
+```
+
+## 3. MCP server — `ziplark-mcp`
+
+A Model Context Protocol server (JSON-RPC over stdio). Read tools
+(`ziplark_info`, `ziplark_list`, `ziplark_read`, `ziplark_grep`, `ziplark_diff`, `ziplark_hash`, `ziplark_test`) are always available; the write tools
+(`ziplark_extract`, `ziplark_create`, `ziplark_add`, `ziplark_rename`, `ziplark_remove`, `ziplark_convert`) require `--allow-write`.
+
+```bash
+cargo build --release -p ziplark-mcp
+```
+Or install the **MCP Bundle** — `ziplark-mcp-<version>.mcpb` on the
+[releases page](https://github.com/zhitongblog/ziplark/releases/latest), one file
+carrying the server for macOS, Windows and Linux. Ziplark is listed in the
+[official MCP registry](https://registry.modelcontextprotocol.io/v0/servers?search=ziplark)
+as `io.github.zhitongblog/ziplark`, so clients that read the registry can find it
+on their own.
+
+Register it with an MCP client:
+```json
+{
+  "mcpServers": {
+    "ziplark": {
+      "command": "/path/to/target/release/ziplark-mcp",
+      "args": ["--allow-write"]
+    }
+  }
+}
+```
+
+### Big archives don't flood the context
+
+`ziplark_list` is paged. It returns at most `limit` entries (default 200) starting
+at `offset`, always alongside the archive's true `total_entries`, so listing a
+200 000-entry disc image costs the same as listing a small ZIP:
+
+```jsonc
+{ "name": "ziplark_list", "arguments": { "path": "disc.iso", "limit": 200 } }
+// -> { "total_entries": 203411, "returned": 200, "next_offset": 200,
+//      "truncated": true, "top_level": [ { "prefix": "usr/share", "entries": 88120 }, … ] }
+```
+
+When the result is truncated it also carries `top_level` — entry counts grouped by
+directory, descending past a single root — so a client can see the *shape* of a huge
+archive without paging through it. To go straight to what you want, filter instead of
+paging: `include` takes path patterns, matched as globs when they contain `*` or `?`
+and as substrings otherwise, and applies before paging. `dirs` selects only files or
+only directories.
+
+```jsonc
+{ "name": "ziplark_list",
+  "arguments": { "path": "disc.iso", "include": ["*/etc/*.conf"], "dirs": false } }
+```
+
+## Building & testing
+```bash
+cargo test                 # engine round-trip + security tests
+cargo build --release      # all crates, size-optimized
+```
+
+## License
+
+**MIT** © 2026 [**doaipm**](https://doaipm.com) — a [doaipm.com](https://doaipm.com) project. See [LICENSE](LICENSE).
+
+Ziplark bundles third-party open-source components under their own licenses,
+acknowledged in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). Note in
+particular that RAR extraction uses the **UnRAR** library, which is under the
+UnRAR license (not MIT) and may not be used to re-create the RAR compression
+algorithm.

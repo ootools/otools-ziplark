@@ -1,0 +1,100 @@
+/* Styles for the "Save as" filename prompt used on top of the host SDK tree.
+   The tree itself is rendered by otools-plugin-sdk; this file only styles the
+   small filename dialog, so it never duplicates or overrides the SDK tree. */
+
+.zl-save-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 18, 24, 0.45);
+  backdrop-filter: blur(2px);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  color: var(--zl-fg, #1c2027);
+}
+
+.zl-save-card {
+  width: min(460px, calc(100vw - 40px));
+  padding: 20px 22px 18px;
+  border-radius: 12px;
+  background: var(--zl-bg, #ffffff);
+  border: 1px solid var(--zl-border, #d8dde5);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+}
+
+.zl-save-card h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.zl-save-dir {
+  margin: 0 0 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-all;
+  opacity: 0.65;
+}
+
+.zl-save-label {
+  display: block;
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.zl-save-label span {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.zl-save-label input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  font-size: 14px;
+  border-radius: 7px;
+  border: 1px solid var(--zl-border, #d8dde5);
+  background: var(--zl-input, #ffffff);
+  color: var(--zl-fg, #1c2027);
+  outline: none;
+}
+
+.zl-save-label input:focus {
+  border-color: var(--zl-accent, #3b82f6);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+}
+
+.zl-save-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.zl-save-actions button {
+  padding: 7px 16px;
+  font-size: 13px;
+  border-radius: 7px;
+  cursor: pointer;
+  border: 1px solid var(--zl-border, #d8dde5);
+  background: transparent;
+  color: var(--zl-fg, #1c2027);
+}
+
+.zl-save-actions button.primary {
+  border-color: transparent;
+  background: var(--zl-accent, #3b82f6);
+  color: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  .zl-save-overlay {
+    --zl-fg: #e7ebf2;
+    --zl-bg: #23272f;
+    --zl-input: #1a1e25;
+    --zl-border: #3a414d;
+    --zl-accent: #4c8dff;
+  }
+}
