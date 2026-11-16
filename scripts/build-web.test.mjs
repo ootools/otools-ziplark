@@ -49,3 +49,13 @@ test('main.js patch is idempotent across rebuilds', () => {
   buildWeb(root);
   assert.equal(read('main.js'), first);
 });
+
+test('index.html wires the tabs controller after main.js', () => {
+  const html = read('index.html');
+  const bridgeAt = html.indexOf('<script src="host-bridge.js"></script>');
+  const mainAt = html.indexOf('<script src="main.js"></script>');
+  const tabsAt = html.indexOf('<script src="tabs.js"></script>');
+  assert.ok(bridgeAt >= 0 && mainAt > bridgeAt, 'bridge must precede main.js');
+  assert.ok(tabsAt > mainAt, 'tabs.js must follow main.js');
+  assert.ok(fs.existsSync(path.join(root, 'dist', 'tabs.js')), 'tabs.js shipped');
+});

@@ -74,7 +74,7 @@ export function buildWeb(directory = root) {
   for (const file of ['index.html', 'main.js', 'styles.css', 'logo.png']) {
     if (!fs.existsSync(path.join(upstream, file))) throw new Error('upstreamUiMissing: ' + file);
   }
-  for (const file of ['host-bridge.js', 'dialogs.js', 'bridge.css']) {
+  for (const file of ['host-bridge.js', 'dialogs.js', 'tabs.js', 'bridge.css']) {
     if (!fs.existsSync(path.join(shell, file))) throw new Error('shellOverlayMissing: ' + file);
   }
   if (!fs.existsSync(path.join(sdk, 'index.js'))) throw new Error('sdkDistMissing');
@@ -88,7 +88,7 @@ export function buildWeb(directory = root) {
   }
   const distMainPath = path.join(dist, 'main.js');
   fs.writeFileSync(distMainPath, applyMainPatch(fs.readFileSync(distMainPath, 'utf8')));
-  for (const file of ['host-bridge.js', 'dialogs.js', 'bridge.css']) {
+  for (const file of ['host-bridge.js', 'dialogs.js', 'tabs.js', 'bridge.css']) {
     copyFile(path.join(shell, file), path.join(dist, file));
   }
   copyTree(path.join(shell, 'sdk-shims'), path.join(dist, 'sdk-shims'));
@@ -103,7 +103,10 @@ export function buildWeb(directory = root) {
   if (!html.includes('<script src="main.js"></script>')) throw new Error('upstreamEntryChanged');
   if (!html.includes('</head>')) throw new Error('upstreamHeadMissing');
   html = html.replace('</head>', IMPORT_MAP + '  </head>');
-  html = html.replace('<script src="main.js"></script>', bridgeTag + '    <script src="main.js"></script>');
+  html = html.replace(
+    '<script src="main.js"></script>',
+    bridgeTag + '    <script src="main.js"></script>\n' + '    <script src="tabs.js"></script>'
+  );
   fs.writeFileSync(path.join(dist, 'index.html'), html);
 
   // Guardrails: the bridge must be installed before main.js, the SDK must be
@@ -111,6 +114,9 @@ export function buildWeb(directory = root) {
   const built = fs.readFileSync(path.join(dist, 'index.html'), 'utf8');
   if (built.indexOf('host-bridge.js') > built.indexOf('<script src="main.js"')) {
     throw new Error('bridgeOrderInvalid');
+  }
+  if (built.indexOf('tabs.js') < built.indexOf('<script src="main.js"')) {
+    throw new Error('tabsOrderInvalid');
   }
   if (!fs.existsSync(path.join(dist, 'sdk/index.js')) || !fs.existsSync(path.join(dist, 'sdk/runtime.js'))) {
     throw new Error('sdkCopyIncomplete');
