@@ -220,10 +220,9 @@
   /* ---- OS "open with" / file association delivery ----
    * plugin.json declares `fileAssociations`; the host routes a double-clicked
    * archive to us via `otools-open-file` + `otools_consume_open_files`.
-   * Everything is funnelled through the native layer's `push_open_file`, which
-   * both queues a `ziplark-open-file` poll event and stores the startup
-   * fallback path for `take_pending_file()`. Emulating the event locally here
-   * would bypass that fallback and lose a cold-start delivery.
+   * 两条来源（SDK 工厂回调：URL 参数 + 启动期 consume；以及敲门直连监听）都汇入
+   * deliverOpenPath 本地投递——push_open_file → poll_events 广播链已退役
+   * （多表面会各开一次），dylib 的方法保留但闲置。
    */
   async function startOpenFileDelivery() {
     try {

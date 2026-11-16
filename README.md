@@ -4,7 +4,7 @@
 移植成 **OTools 独立原生插件**。归档运算全部在插件自带的 Rust 动态库里本地完成，
 文件选择走宿主 SDK 的页面内文件树，完全离线。
 
-- 上游快照：`9d539b6`（v0.6.0 之后的密码提示修复），原样保存在 `upstream/`，不可就地修改。
+- 上游快照：`9d539b6`（v0.6.0 之后的密码提示修复），原样保存在 `upstream/`，不可就地修改；构建时对 dist 拷贝应用声明过的锚点补丁（见 `scripts/build-web.mjs` 的 `MAIN_PATCH_*`）。
 - 插件形态：`openMode: panel` + `native.enabled`，六平台分包（`packageMode=1`）。
 - 仓库：<https://github.com/ootools/otools-ziplark>，作为 `xyito` 父仓的子模块挂在
   `otools/otools-ziplark`。
@@ -32,7 +32,7 @@ docs/
   file-associations.md    宿主文件关联的声明、绑定与冷启动投递链路
 ```
 
-**上游 `ui/` 一行没改**：它只依赖 `window.__TAURI__` 的三个入口，桥接层把它们分别映射到：
+**上游 `ui/` 快照不改，构建补丁最小化**：`ui/` 原样进 dist，唯一差异是 `main.js` 的 `__ztState` 状态出口锚点（TABS 用）；它只依赖 `window.__TAURI__` 的三个入口，桥接层把它们分别映射到：
 
 | 上游入口 | OTools 侧 |
 | --- | --- |

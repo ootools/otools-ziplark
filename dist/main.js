@@ -49,6 +49,15 @@ const MODIFIABLE_FORMATS = new Set(["zip", "sevenz", "7z", "tar", "targz", "tarb
 let currentArchive = null;     // { path, password, format, volumes }
 let archiveStack = [];         // parent archives when drilling into a nested archive
 let createInputs = [];         // string[]
+/* ziplark-tabs: 状态出口（build 注入，见 docs/tabs-design.md §1；勿手改） */
+window.__ztState = {
+  getCurrentArchive() { return currentArchive; },
+  setCurrentArchive(v) { currentArchive = v; },
+  getArchiveStack() { return archiveStack; },
+  setArchiveStack(v) { archiveStack = v; },
+  getTree() { return tree; },
+};
+/* ziplark-tabs:end */
 
 /* ---------- i18n (9 languages) ---------- */
 const I18N = {
