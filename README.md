@@ -49,7 +49,9 @@ docs/
 面板的失焦自动隐藏把 sheet 父窗口关掉，picker 立即 dismiss；收尾时 rfd 复位 activation
 policy / 重新 `makeKeyAndOrderFront` 又打乱了 AppKit 进程级 modal 状态，后续调用在同一坏条件下
 继续秒退。详见 [docs/host-file-picker.md](docs/host-file-picker.md)。
-**本插件完全不弹 OS picker**，所有选择走 SDK 的页面内文件树。
+**本插件完全不弹 OS picker**，所有选择走 SDK 的页面内文件树（不依赖宿主版本、Web 模式也能用）。
+宿主侧根因也已在 OTools 主仓 `2e5a03cd` 修复（对话框会话护栏 + 无 parent 命令优先），
+详见 [docs/host-file-picker.md](docs/host-file-picker.md)。
 
 **2. 宿主是否支持插件拖拽**
 支持，但不是 HTML5 `dataTransfer.files`。wry 默认拦截 OS 原生 drop（所以 `File` 对象拿不到），

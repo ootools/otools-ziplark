@@ -67,6 +67,16 @@ rfd 的 `policy_manager.rs:15-18` **只在 `Prohibited` 时**临时把策略升�
 
 ## 4. 修复 / 规避方向
 
+> **宿主侧已修复（OTools 主仓，本次一并提交）**。实际落地的组合是下面第 2、3 项：
+>
+> - `crates/ot-platform-core/src/webview_fs/dialog_guard.rs`（新增）：全局 OS 对话框会话计数 + RAII guard；三个 `tools_webview_pick_*` 把 `blocking_pick_*` 包住。
+> - `src-tauri/src/platform/panel/focus_state.rs` / `focus.rs`：会话期间（或 macOS 上 `NSApplication.modalWindow` 非空时，覆盖第三方 `plugin:dialog|open`）抑制面板自动隐藏，并持续刷新保护窗口，dialog 关闭后留 600ms 缓冲再判断。
+> - `src/platform/runtime/otools/index.ts` 与 `embedded-runtime.js`：`dialog.open/save` 改为**优先宿主命令**（`app_handle.dialog().file()` 无 `set_parent`），只在命令真正抛错时才回落 `plugin:dialog|open`；用户取消（`null`）不回落，避免二次弹框。注入运行时仍保留 `window.__otoolsHostTree` 的远程模式兜底。
+>
+> 这样 sheet 的父窗口不会在 picker 期间被关掉，rfd 的收尾也不会把 AppKit 模态状态拧乱，因此可以反复打开。本插件**仍然**使用页面内文件树（第 1 项），因为它不依赖宿主版本、远程 Web 模式也能用。
+>
+> 尚未实施（可选加固）：第 4、5 项。若实机仍出现「Accessory 应用下 NSOpenPanel 不激活」，再考虑临时 `Regular` 或改非 blocking 的 `pick_file_async`。
+
 按代价从低到高：
 
 1. **插件侧彻底不弹 OS picker**（本插件采用）：用宿主 SDK 的
