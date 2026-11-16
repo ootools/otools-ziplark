@@ -159,6 +159,64 @@
     emitLocal('ziplark-open-file', value);
   }
 
+  /** SDK onOtoolsOpenFile 的回调（URL 参数 + 启动期 consume）：本地投递，不再 push。 */
+  function handleOtoolsOpenFile(files) {
+    (files || []).forEach(function (file) {
+      if (!file || !file.path) return;
+      deliverOpenPath(file.path);
+    });
+  }
+
+  /** 敲门后取走投给自己的文件列表。走 wrapped `otools.invoke`：native 先报
+   * Unknown method、命中回落标记后自动落到宿主命令（老宿主 dylib 无此方法）。 */
+  async function consumeOpenFiles() {
+    var api = hostApi();
+    if (!api || typeof api.invoke !== 'function') {
+      log('consume_open_files skipped: otools.invoke unavailable');
+      return;
+    }
+    var uuid = resolvePluginUuid();
+    if (!uuid) return;
+    try {
+      var paths = await api.invoke('otools_consume_open_files', {pluginUuid: uuid});
+      (Array.isArray(paths) ? paths : []).forEach(function (path) {
+        deliverOpenPath(path);
+      });
+    } catch (error) {
+      log('consume_open_files failed: ' + String(error && error.message || error));
+    }
+  }
+
+  /** 敲门监听 target：与拖拽（startDragEvents）同一套兜底策略。宿主 emit_to 的
+   * AnyLabel 只匹配带 label 的监听器，默认 Any 永远收不到——这正是本修复的根因。 */
+  function knockListenerTargets() {
+    var webview = webviewLabel();
+    var win = windowLabel();
+    var targets = [];
+    if (webview) targets.push({kind: 'Webview', label: webview});
+    if (win && win !== webview) targets.push({kind: 'Window', label: win});
+    if (!targets.length) targets.push({kind: 'Any'});
+    return targets;
+  }
+
+  async function startKnockListener() {
+    try {
+      var rt = await import('./sdk/runtime.js');
+      if (typeof rt.listenTauri !== 'function') return;
+      // 事件名与 SDK 的 OTOOLS_FILE_DELIVER_EVENT 对齐（宿主 emit_to("otools-open-file")）。
+      var jobs = knockListenerTargets().map(function (target) {
+        return rt.listenTauri('otools-open-file', function () {
+          void consumeOpenFiles();
+        }, {target: target}).catch(function (error) {
+          log('knock listener -> ' + target.kind + ' failed: ' + String(error));
+        });
+      });
+      await Promise.all(jobs);
+    } catch (error) {
+      log('knock listener unavailable: ' + String(error && error.message || error));
+    }
+  }
+
   /* ---- OS "open with" / file association delivery ----
    * plugin.json declares `fileAssociations`; the host routes a double-clicked
    * archive to us via `otools-open-file` + `otools_consume_open_files`.
@@ -172,12 +230,7 @@
       var sdk = await import('./sdk/index.js');
       if (typeof sdk.onOtoolsOpenFile !== 'function') return;
       await sdk.onOtoolsOpenFile(function (files) {
-        (files || []).forEach(function (file) {
-          if (!file || !file.path) return;
-          invoke('push_open_file', { path: file.path }).catch(function (error) {
-            log('push_open_file failed: ' + String(error && error.message || error));
-          });
-        });
+        handleOtoolsOpenFile(files);
       });
     } catch (error) {
       log('onOtoolsOpenFile unavailable: ' + String(error && error.message || error));
@@ -237,6 +290,7 @@
     started = true;
     startNativeEvents();
     startOpenFileDelivery();
+    startKnockListener();
     startDragEvents();
   }
 
@@ -283,5 +337,8 @@
     resolvePluginUuid: resolvePluginUuid,
     deliverOpenPath: deliverOpenPath,
     recentDeliveries: recentDeliveries,
+    handleOtoolsOpenFile: handleOtoolsOpenFile,
+    consumeOpenFiles: consumeOpenFiles,
+    knockListenerTargets: knockListenerTargets,
   };
 })();

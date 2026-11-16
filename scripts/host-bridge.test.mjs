@@ -70,3 +70,69 @@ test('deliverOpenPath ignores blank paths and prunes expired entries', () => {
   assert.ok(!hooks.recentDeliveries.has('/tmp/old.zip'), 'expired entries are pruned');
   assert.ok(hooks.recentDeliveries.has('/tmp/new.zip'));
 });
+
+test('consumeOpenFiles delivers every consumed path locally with the plugin uuid', async () => {
+  const window = makeWindow();
+  const events = [];
+  const invokes = [];
+  window.otools = {
+    invoke: async (command, args) => {
+      invokes.push([command, args]);
+      return ['/a.zip', '/b.zip'];
+    },
+    invokeNative: () => assert.fail('consume must not reach the dylib'),
+  };
+  await window.__TAURI__.event.listen('ziplark-open-file', (e) => events.push(e.payload));
+
+  await window.__ZIPLARK_TEST__.consumeOpenFiles();
+
+  // vm 跨 realm 对象原型不同，逐字段断言而不是 deepEqual。
+  assert.equal(invokes.length, 1);
+  assert.equal(invokes[0][0], 'otools_consume_open_files');
+  assert.equal(invokes[0][1].pluginUuid, 'otools-ziplark');
+  assert.deepEqual(events, ['/a.zip', '/b.zip']);
+});
+
+test('consumeOpenFiles tolerates an empty queue and an invoke failure', async () => {
+  const window = makeWindow();
+  const events = [];
+  await window.__TAURI__.event.listen('ziplark-open-file', (e) => events.push(e.payload));
+
+  window.otools = {invoke: async () => []};
+  await window.__ZIPLARK_TEST__.consumeOpenFiles();
+  assert.deepEqual(events, []);
+
+  window.otools = {invoke: async () => { throw new Error('Unknown method'); }};
+  await window.__ZIPLARK_TEST__.consumeOpenFiles(); // must not throw
+  assert.deepEqual(events, []);
+});
+
+test('the SDK open-file callback delivers locally and never calls push_open_file', async () => {
+  const window = makeWindow();
+  const events = [];
+  let nativeCalls = 0;
+  window.otools = {
+    invoke: async () => [],
+    invokeNative: () => { nativeCalls += 1; },
+  };
+  await window.__TAURI__.event.listen('ziplark-open-file', (e) => events.push(e.payload));
+
+  window.__ZIPLARK_TEST__.handleOtoolsOpenFile([{path: '/a.zip'}]);
+  window.__ZIPLARK_TEST__.handleOtoolsOpenFile([{path: ''}, null]);
+  assert.deepEqual(events, ['/a.zip']);
+  assert.equal(nativeCalls, 0, 'push_open_file must stay retired');
+});
+
+test('knockListenerTargets prefers the webview label and falls back to Any', () => {
+  const window = makeWindow();
+  const hooks = window.__ZIPLARK_TEST__;
+  const targets = hooks.knockListenerTargets();
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].kind, 'Webview');
+  assert.equal(targets[0].label, 'tools-tab-plugin-market:otools-ziplark');
+
+  window.__TAURI_INTERNALS__.metadata.currentWebview.label = '';
+  const fallback = hooks.knockListenerTargets();
+  assert.equal(fallback.length, 1);
+  assert.equal(fallback[0].kind, 'Any');
+});
