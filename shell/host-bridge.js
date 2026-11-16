@@ -106,6 +106,59 @@
     }
   }
 
+  /* ---- open-file delivery helpers ----
+   * 统一投递出口：三个来源（URL 参数兜底、启动期 consume、敲门 consume）都汇入
+   * deliverOpenPath，5 秒滑动窗口去重后 emitLocal 本地打开——不再走
+   * push_open_file → poll_events 全局广播（多表面会各开一次）。去重窗口的代价：
+   * 5 秒内刻意重开同一文件会被忽略，此时 UI 本来就显示着它。
+   */
+  var recentDeliveries = new Map();
+  var DELIVER_DEDUPE_WINDOW_MS = 5000;
+
+  function normalizePluginUuidFromLabel(label) {
+    var raw = String(label || '').trim();
+    if (!raw) return '';
+    var splitAt = raw.lastIndexOf(':');
+    if (splitAt <= 0 || splitAt >= raw.length - 1) return raw;
+    // 宿主 label 形如 `tools-tab-plugin-market:otools-ziplark` / `panel-plugin-market:…`：
+    // 先剥表面前缀再按 source:uuid 归一化（对齐宿主 normalizeRuntimePluginUuid 的白名单）。
+    var source = raw.slice(0, splitAt).trim().toLowerCase()
+      .replace(/^(tools-tab-plugin-|panel-plugin-|plugin-)/, '');
+    var pluginId = raw.slice(splitAt + 1).trim();
+    if (source === 'builtin' || source === 'market' || source === 'dev-debug' || source === 'dev-workspace') {
+      return pluginId;
+    }
+    return raw;
+  }
+
+  function resolvePluginUuid() {
+    try {
+      var env = window.__OToolsEnv;
+      var fromEnv = env && typeof env.pluginUuid === 'string' ? env.pluginUuid.trim() : '';
+      if (fromEnv) return fromEnv;
+    } catch (_) {
+      /* fall through to the label */
+    }
+    return normalizePluginUuidFromLabel(webviewLabel());
+  }
+
+  function pruneRecentDeliveries(now) {
+    recentDeliveries.forEach(function (seenAt, delivered) {
+      if (now - seenAt >= DELIVER_DEDUPE_WINDOW_MS) recentDeliveries.delete(delivered);
+    });
+  }
+
+  function deliverOpenPath(path) {
+    var value = String(path || '').trim();
+    if (!value) return;
+    var now = Date.now();
+    pruneRecentDeliveries(now);
+    var seenAt = recentDeliveries.get(value);
+    if (typeof seenAt === 'number' && now - seenAt < DELIVER_DEDUPE_WINDOW_MS) return;
+    recentDeliveries.set(value, now);
+    emitLocal('ziplark-open-file', value);
+  }
+
   /* ---- OS "open with" / file association delivery ----
    * plugin.json declares `fileAssociations`; the host routes a double-clicked
    * archive to us via `otools-open-file` + `otools_consume_open_files`.
@@ -222,5 +275,13 @@
     open: dialogOpen,
     save: dialogSave,
     log: log,
+  };
+
+  // 纯逻辑测试钩子（node:vm 加载本文件后驱动）；宿主集成行为由端到端验证覆盖。
+  window.__ZIPLARK_TEST__ = {
+    normalizePluginUuidFromLabel: normalizePluginUuidFromLabel,
+    resolvePluginUuid: resolvePluginUuid,
+    deliverOpenPath: deliverOpenPath,
+    recentDeliveries: recentDeliveries,
   };
 })();
