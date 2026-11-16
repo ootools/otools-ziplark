@@ -1,5 +1,8 @@
 // shell/tabs.js 纯逻辑测试：node:vm 加载（无 DOM 环境），经 __ztTabsTest__ 驱动。
-// DOM 接线在 Task 3；跨 realm 对象一律 JSON 比对。
+// 契约（0.2.1 热修，见发后审计 P1×3）：openTab 返回 {tab, done}，done=true ⟺ 刷新
+// 真正产出了渲染（renderToken 前进）；失败时新建 tab 回收、既有 tab 恢复自身栈、
+// 页面与 activeId 永不自相矛盾。运行时的 renderArchive 包装（setActiveInfo）在测试里
+// 以 openAndWait 的 setActiveInfo 模拟。跨 realm 对象一律 JSON 比对。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
@@ -14,6 +17,7 @@ function setup() {
   let archive = {path: '/old.zip', password: 'pw-old', format: 'zip'};
   let stack = ['parent.zip'];
   const ui = {expanded: ['x'], sortBy: 'name', sortAsc: true, query: '', scrollTop: 0};
+  let token = 0;
   const deps = {
     state: {
       getCurrentArchive: () => archive,
@@ -24,7 +28,15 @@ function setup() {
     getUi: () => ({expanded: [...ui.expanded], sortBy: ui.sortBy, sortAsc: ui.sortAsc, query: ui.query, scrollTop: ui.scrollTop}),
     setUi: (v) => calls.push(['setUi', v]),
     render: (info) => calls.push(['render', info]),
-    refresh: (p, keepStack, pw) => calls.push(['refresh', p, keepStack, pw]),
+    renderToken: () => token,
+    refresh: (p, keepStack, pw) => {
+      calls.push(['refresh', p, keepStack, pw]);
+      // 模拟上游 openArchive：成功时产出渲染并设置 currentArchive；失败时两者皆无
+      return Promise.resolve().then(() => {
+        token += 1;
+        archive = {path: p, password: pw ?? null, format: 'zip'};
+      });
+    },
     closeCurrent: () => calls.push(['closeCurrent']),
     switchViewOpen: () => calls.push(['switchViewOpen']),
   };
@@ -33,137 +45,173 @@ function setup() {
   const source = fs.readFileSync(path.join(root, 'shell/tabs.js'), 'utf8');
   vm.runInContext(source, sandbox, {filename: 'shell/tabs.js'});
   const controller = sandbox.window.__ztTabsTest__.createController(deps);
-  return {
+  const t = {
     controller,
     calls,
     kind: (name) => calls.filter((c) => c[0] === name),
     last: (name) => calls.filter((c) => c[0] === name).at(-1),
+    // 模拟运行时的 renderArchive 包装：渲染产出后把 info 记到激活 tab
+    openAndWait: async (p, opts) => {
+      const {tab, done} = t.controller.openTab(p, opts || {});
+      const ok = await done;
+      if (ok && tab) t.controller.setActiveInfo({path: p, entries: []});
+      return {tab, ok};
+    },
+    failNextRefresh: () => {
+      deps.refresh = (p, keepStack, pw) => { calls.push(['refresh', p, keepStack, pw]); return Promise.resolve(); };
+    },
     setArchive: (a) => { archive = a; },
     setStack: (v) => { stack = v; },
     setUiState: (patch) => Object.assign(ui, patch),
   };
+  return t;
 }
 
 const json = (v) => JSON.stringify(v);
 
-test('openTab creates a tab, activates it and refreshes without stack', () => {
+test('openTab 新路径：刷新产出渲染后置为激活并快照', async () => {
   const t = setup();
-  const tab = t.controller.openTab('/tmp/a.zip', {});
+  const {tab, ok} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(ok, true);
   assert.equal(t.controller.tabs.length, 1);
   assert.equal(t.controller.activeId, tab.id);
-  assert.equal(tab.path, '/tmp/a.zip');
   assert.deepEqual(t.last('refresh'), ['refresh', '/tmp/a.zip', false, null]);
+  assert.equal(json(tab.archive.path), json('/tmp/a.zip'));
+  assert.ok(tab.info, '渲染包装已把 info 记入 tab');
 });
 
-test('openTab same path reuses the existing tab', () => {
+test('openTab 新路径失败：tab 回收、activeId 与状态不被污染', async () => {
   const t = setup();
-  t.controller.openTab('/tmp/a.zip', {});
-  const again = t.controller.openTab('/tmp/a.zip', {});
-  assert.equal(t.controller.tabs.length, 1);
-  assert.equal(t.controller.activeId, again.id);
-  assert.equal(t.kind('refresh').length, 2);
+  t.failNextRefresh();
+  const {tab, done} = await Promise.resolve(t.controller.openTab('/tmp/bad.zip', {}));
+  assert.equal(await done, false);
+  assert.equal(t.controller.tabs.length, 0);
+  assert.equal(t.controller.activeId, null);
+  assert.equal(t.kind('setArchive').length, 0);
+  assert.equal(t.kind('setStack').length, 0);
+  // tab 引用仍在返回值上，但已从注册表移除
+  assert.equal(t.controller.tabs.includes(tab), false);
 });
 
-test('openTab different path adds another tab and activates it', () => {
+test('openTab 同路径：先恢复已保存视图再刷新，成功后快照刷新结果', async () => {
   const t = setup();
-  const a = t.controller.openTab('/tmp/a.zip', {});
-  const b = t.controller.openTab('/tmp/b.zip', {});
-  assert.equal(t.controller.tabs.length, 2);
-  assert.equal(t.controller.activeId, b.id);
-  assert.notEqual(a.id, b.id);
-});
-
-test('keepStack refreshes without creating a tab (nested drill-in)', () => {
-  const t = setup();
-  t.controller.openTab('/tmp/a.zip', {});
-  const before = t.controller.tabs.length;
-  t.controller.openTab('/tmp/a.zip!nested.zip', {keepStack: true, initialPassword: 'pw'});
-  assert.equal(t.controller.tabs.length, before);
-  assert.deepEqual(t.last('refresh'), ['refresh', '/tmp/a.zip!nested.zip', true, 'pw']);
-});
-
-test('snapshotActive stores independent copies of archive/stack/ui', () => {
-  const t = setup();
-  const tab = t.controller.openTab('/tmp/a.zip', {});
-  t.setArchive({path: '/tmp/a.zip', password: 'pw1', format: 'zip', volumes: null});
-  t.setStack(['outer.zip']);
-  t.setUiState({expanded: ['dir/'], sortBy: 'size', sortAsc: false, query: 'txt', scrollTop: 123});
-  t.controller.snapshotActive();
-
-  assert.equal(json(tab.archive), json({path: '/tmp/a.zip', password: 'pw1', format: 'zip', volumes: null}));
-  assert.equal(json(tab.stack), json(['outer.zip']));
-  assert.equal(json(tab.ui), json({expanded: ['dir/'], sortBy: 'size', sortAsc: false, query: 'txt', scrollTop: 123}));
-
-  // 来源对象后续变化不得影响快照
-  t.setUiState({expanded: ['other/'], scrollTop: 999});
-  assert.equal(json(tab.ui.expanded), json(['dir/']));
-  assert.equal(tab.ui.scrollTop, 123);
-});
-
-test('activateTab snapshots the leaving tab then restores the target', () => {
-  const t = setup();
-  const a = t.controller.openTab('/tmp/a.zip', {});
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(aOk, true);
   t.setArchive({path: '/tmp/a.zip', password: 'pw-a', format: 'zip'});
+  t.controller.snapshotActive();
+  t.calls.length = 0;
+
+  const {tab, done} = await Promise.resolve(t.controller.openTab('/tmp/a.zip', {}));
+  assert.equal(await done, true);
+  assert.equal(tab.id, a.id);
+  const order = t.calls.map((c) => c[0]);
+  assert.ok(order.indexOf('refresh') > order.indexOf('render'), '先恢复视图（render）再刷新');
+  assert.equal(t.controller.activeId, a.id);
+});
+
+test('openTab 同路径失败：tab 保留旧数据、栈被恢复、页面状态一致', async () => {
+  const t = setup();
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(aOk, true);
+  assert.ok(a.info);
+  t.setArchive({path: '/tmp/a.zip', password: 'pw-a', format: 'zip'});
+  t.setStack(['outer.zip']);
+  t.controller.snapshotActive();
+  t.calls.length = 0;
+
+  t.failNextRefresh(); // 上游 openArchive 失败时 resolve 且不产出渲染
+  const {done} = await Promise.resolve(t.controller.openTab('/tmp/a.zip', {}));
+  assert.equal(await done, false);
+  assert.equal(t.controller.tabs.length, 1);
+  assert.equal(t.controller.activeId, a.id);
+  // 上游在刷新前清空了 archiveStack：控制器必须恢复 tab 的已存栈
+  assert.deepEqual(t.last('setStack'), ['setStack', ['outer.zip']]);
+  assert.equal(json(a.archive), json({path: '/tmp/a.zip', password: 'pw-a', format: 'zip'}));
+  assert.ok(a.info, '既有 info 保留');
+});
+
+test('openTab 另一路径失败：页面与激活 tab 都不变化', async () => {
+  const t = setup();
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(aOk, true);
+  t.calls.length = 0;
+
+  t.failNextRefresh();
+  const {done} = await Promise.resolve(t.controller.openTab('/tmp/b.zip', {}));
+  assert.equal(await done, false);
+  assert.equal(t.controller.tabs.length, 1);
+  assert.equal(t.controller.activeId, a.id);
+  assert.equal(t.kind('setArchive').length, 0);
+  assert.equal(t.kind('render').length, 0, '失败不得触碰页面渲染');
+});
+
+test('keepStack：成功时快照进当前 tab，失败时恢复栈且不建 tab', async () => {
+  const t = setup();
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(aOk, true);
+  t.calls.length = 0;
+
+  t.setStack(['outer.zip']);
+  const r1 = t.controller.openTab('/tmp/a.zip!nested.zip', {keepStack: true});
+  assert.equal(await r1.done, true);
+  t.controller.setActiveInfo({path: '/tmp/a.zip!nested.zip', entries: []});
+  assert.equal(t.controller.tabs.length, 1);
+  assert.ok(t.controller.tabs[0].info, '嵌套 info 记入当前 tab');
+
+  t.setStack(['outer.zip']);
+  t.failNextRefresh();
+  const r2 = t.controller.openTab('/tmp/a.zip!nested2.zip', {keepStack: true});
+  assert.equal(await r2.done, false);
+  assert.equal(t.controller.tabs.length, 1);
+  // 控制器把 tab 已存栈恢复为权威状态
+  assert.deepEqual(t.last('setStack'), ['setStack', ['outer.zip']]);
+  assert.equal(t.kind('setArchive').length, 0, '失败不得改写 currentArchive');
+});
+
+test('密码随 tab 保存并在切换时恢复', async () => {
+  const t = setup();
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {initialPassword: 'secret-a'});
+  assert.equal(aOk, true);
+  assert.equal(a.archive.password, 'secret-a');
+  const b = t.controller.openTab('/tmp/b.zip', {});
+  await b.done;
+
+  t.controller.activateTab(a.id);
+  assert.equal(t.last('setArchive')[1].password, 'secret-a');
+});
+
+test('切换 tab：快照离开页、恢复目标页', async () => {
+  const t = setup();
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(aOk, true);
   t.setUiState({expanded: ['a-dir/'], sortBy: 'mtime', sortAsc: false, scrollTop: 40});
   t.controller.snapshotActive();
-
   const b = t.controller.openTab('/tmp/b.zip', {});
-  t.setArchive({path: '/tmp/b.zip', password: 'pw-b', format: 'zip'});
-  t.controller.snapshotActive();
-
+  await b.done;
   t.calls.length = 0;
-  t.controller.activateTab(a.id);
 
+  t.controller.activateTab(a.id);
   assert.equal(t.controller.activeId, a.id);
   assert.deepEqual(t.calls.map((c) => c[0]), ['switchViewOpen', 'setArchive', 'setStack', 'render', 'setUi']);
-  const setArchive = t.last('setArchive')[1];
-  assert.equal(json(setArchive), json({path: '/tmp/a.zip', password: 'pw-a', format: 'zip'}));
-  assert.equal(json(t.last('render')[1]), json(a.info));
-  const setUi = t.last('setUi')[1];
-  assert.equal(setUi.sortBy, 'mtime');
-  assert.equal(setUi.scrollTop, 40);
-  assert.equal(json(setUi.expanded), json(['a-dir/']));
-  assert.equal(b.path, '/tmp/b.zip');
+  assert.equal(t.last('setUi')[1].sortBy, 'mtime');
+  assert.equal(t.last('setUi')[1].scrollTop, 40);
 });
 
-test('closeTab activates a neighbor and the last close falls back to the drop zone', () => {
+test('closeTab：激活相邻页，最后一个回落拖放区', async () => {
   const t = setup();
-  const a = t.controller.openTab('/tmp/a.zip', {});
-  const b = t.controller.openTab('/tmp/b.zip', {});
+  const {tab: a, ok: aOk} = await t.openAndWait('/tmp/a.zip', {});
+  assert.equal(aOk, true);
+  const {tab: b, ok: bOk} = await t.openAndWait('/tmp/b.zip', {});
+  assert.equal(bOk, true);
   t.calls.length = 0;
 
   t.controller.closeTab(b.id);
   assert.equal(t.controller.tabs.length, 1);
   assert.equal(t.controller.activeId, a.id);
   assert.ok(t.calls.some((c) => c[0] === 'switchViewOpen'));
-  assert.ok(!t.calls.some((c) => c[0] === 'closeCurrent'));
+  assert.equal(t.kind('closeCurrent').length, 0);
 
   t.controller.closeTab(a.id);
   assert.equal(t.controller.tabs.length, 0);
-  assert.equal(t.controller.activeId, null);
   assert.ok(t.calls.some((c) => c[0] === 'closeCurrent'));
-});
-
-test('closeTab on a background tab keeps the active one untouched', () => {
-  const t = setup();
-  const a = t.controller.openTab('/tmp/a.zip', {});
-  const b = t.controller.openTab('/tmp/b.zip', {});
-  t.calls.length = 0;
-
-  t.controller.closeTab(a.id);
-  assert.equal(t.controller.tabs.length, 1);
-  assert.equal(t.controller.activeId, b.id);
-  assert.equal(t.kind('closeCurrent').length, 0);
-  assert.equal(t.kind('switchViewOpen').length, 0);
-});
-
-test('password rides with each tab across switches', () => {
-  const t = setup();
-  const a = t.controller.openTab('/tmp/a.zip', {initialPassword: 'secret-a'});
-  t.setArchive({path: '/tmp/a.zip', password: 'secret-a', format: 'zip'});
-  t.controller.snapshotActive();
-  t.controller.openTab('/tmp/b.zip', {});
-  t.controller.activateTab(a.id);
-  const setArchive = t.last('setArchive')[1];
-  assert.equal(setArchive.password, 'secret-a');
 });

@@ -99,14 +99,15 @@
   }
 }
 
-/* ---------- 归档多标签条（shell/tabs.js 注入） ---------- */
+/* ---------- 归档多标签条（shell/tabs.js 注入） ----------
+   全部使用上游主题变量（--bg/--surface/--border/--text/--shadow），暗色模式自动跟随。 */
 .zt-tabstrip {
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px 14px 0;
-  border-bottom: 1px solid var(--border, #e3e5ea);
-  background: var(--bg, #f6f7f9);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
 }
 .zt-tabstrip.hidden { display: none; }
 .zt-tab-items {
@@ -125,34 +126,39 @@
   border: 1px solid transparent;
   border-radius: 8px 8px 0 0;
   background: transparent;
-  color: var(--text-muted, #5f6368);
+  color: var(--text);
+  opacity: 0.72;
   font-size: 12px;
   cursor: pointer;
   white-space: nowrap;
 }
-.zt-tab:hover { background: var(--bg-hover, #ececf0); }
+.zt-tab:hover { background: var(--surface); opacity: 1; }
 .zt-tab.active {
-  background: #fff;
-  border-color: var(--border, #e3e5ea);
-  border-bottom-color: #fff;
-  color: var(--text, #1d1d1f);
+  background: var(--surface);
+  border-color: var(--border);
+  border-bottom-color: var(--surface);
+  color: var(--text);
+  opacity: 1;
   font-weight: 600;
+  box-shadow: var(--shadow);
 }
 .zt-tab-name { overflow: hidden; text-overflow: ellipsis; }
 .zt-close {
   padding: 0 2px;
   border-radius: 4px;
-  color: var(--text-muted, #9a9aa0);
+  color: var(--text);
+  opacity: 0.55;
   font-size: 13px;
   line-height: 1;
 }
-.zt-close:hover { background: var(--bg-hover, #e0e0e5); color: #b42318; }
+.zt-close:hover { background: var(--surface); opacity: 1; color: var(--accent, #4c8dff); }
 .zt-open-btn {
   flex: none;
-  border: 1px dashed var(--border, #c9cbd1);
+  border: 1px dashed var(--border);
   border-radius: 8px;
   padding: 4px 10px;
-  color: var(--text-muted, #5f6368);
+  color: var(--text);
+  opacity: 0.8;
   background: transparent;
 }
-.zt-open-btn:hover { background: var(--bg-hover, #ececf0); color: var(--text, #1d1d1f); }
+.zt-open-btn:hover { background: var(--surface); opacity: 1; }
