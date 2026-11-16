@@ -1,4 +1,3 @@
-import { UnlistenFn } from './runtime';
 /** 宿主投递敲门事件名（与宿主 platform/keyword_dispatch.rs 的 KEYWORD_DISPATCH_EVENT 对齐）。 */
 export declare const OTOOLS_KEYWORD_DISPATCH_EVENT = "otools-keyword-dispatch";
 export interface OtoolsKeywordDispatch {
@@ -12,9 +11,6 @@ export interface OtoolsKeywordDispatch {
     source: string;
     createdAtMs: number;
 }
-/**
- * 订阅宿主派发的关键词。返回 unlisten。
- *
- * @param handler 收到关键词（按 id 去重合并后）触发；批量派发一次回调给全量。
- */
-export declare function onOtoolsKeyword(handler: (items: OtoolsKeywordDispatch[]) => void): Promise<UnlistenFn>;
+export type KeywordUnlisten = () => void | Promise<void>;
+/** 订阅器签名（`window.otools.onOtoolsKeyword` 就是它）。 */
+export type KeywordListener = (handler: (items: OtoolsKeywordDispatch[]) => void) => Promise<KeywordUnlisten>;

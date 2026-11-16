@@ -1,10 +1,10 @@
-import { listenTauri as r, invoke as t } from "./runtime.js";
-import { createCaptureApi as e } from "./capture-factory.js";
-import { CaptureError as n } from "./capture-factory.js";
-const i = e({ invoke: t, listen: r });
+const r = new Proxy({}, {
+  get(n, e) {
+    const t = typeof window < "u" ? window.otools?.capture : void 0, o = t?.[e];
+    return typeof o != "function" ? o : o.bind(t);
+  }
+});
 export {
-  n as CaptureError,
-  i as capture,
-  e as createCaptureApi
+  r as capture
 };
 //# sourceMappingURL=capture.js.map

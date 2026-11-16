@@ -54,10 +54,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Verify the upstream snapshot and vendored SDK are untouched
-        run: |
-          node scripts/sync-upstream.mjs --check
-          node scripts/sync-sdk.mjs --check
+      - name: Verify the upstream snapshot is untouched
+        run: node scripts/sync-upstream.mjs --check
       - name: Overlay regression tests
         run: node --test scripts/*.test.mjs
       - name: Build the static frontend overlay

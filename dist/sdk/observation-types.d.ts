@@ -47,9 +47,3 @@ export interface ObservationApi {
         id: string;
     }): Promise<void>;
 }
-export declare class ObservationError extends Error {
-    readonly code: string;
-    constructor(code: string, message: string);
-}
-/** Dependency-free factory also suitable for the host's plain-webview injection. */
-export declare function createObservationApi(transport: ObservationTransport): ObservationApi;

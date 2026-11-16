@@ -24,4 +24,3 @@ export interface DeepLinkTransport {
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>;
     listen(event: string, handler: () => void): Promise<() => void>;
 }
-export declare function createDeepLinksApi(transport: DeepLinkTransport): DeepLinksApi;

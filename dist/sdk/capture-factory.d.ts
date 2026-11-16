@@ -115,8 +115,12 @@ export interface CaptureApi {
     retain(imageId: string): Promise<CaptureImage>;
     release(imageId: string): Promise<void>;
 }
+/**
+ * 截屏错误类。**实现只有一份**——宿主 `window.otools.CaptureError`。
+ * 这里保留 `declare` 只为让类型能引用构造签名，运行时不会产出任何东西；
+ * 插件请用 `new window.otools.CaptureError(code, message)`。
+ */
 export declare class CaptureError extends Error implements CaptureFailure {
-    readonly code: CaptureErrorCode;
+    code: CaptureErrorCode;
     constructor(code: CaptureErrorCode, message: string);
 }
-export declare function createCaptureApi(transport: CaptureTransport): CaptureApi;

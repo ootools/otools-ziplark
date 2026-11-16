@@ -41,7 +41,7 @@ function copyTree(source, target) {
 export function buildWeb(directory = root) {
   const upstream = path.join(directory, 'upstream/ui');
   const shell = path.join(directory, 'shell');
-  const sdk = path.join(directory, 'vendor/otools-plugin-sdk-dist');
+  const sdk = path.join(directory, 'node_modules/otools-plugin-sdk/dist');
   const dist = path.join(directory, 'dist');
 
   for (const file of ['index.html', 'main.js', 'styles.css', 'logo.png']) {
