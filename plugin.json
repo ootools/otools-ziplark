@@ -1,7 +1,7 @@
 {
   "packid": "otools-ziplark",
   "uuid": "otools-ziplark",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minOtoolsVersion": "0.9.1",
   "displayName": "Ziplark Archiver",
   "displayNameCN": "Ziplark 压缩管理",
