@@ -131,6 +131,19 @@ Tauri 2.10（`manager/mod.rs` `emit_to`/`filter_target`）对 `AnyLabel{label}` 
    面板与标签并存时打开文件 → 恰好一个表面切换。
 4. 宿主侧修复合入后回归 1–3，并跑宿主相关单测。
 
+### 验证记录（2026-11-17，Phase A 装入宿主 0.9.8 后）
+
+受控复现（`open -a OTools` 显式路由，等价于 Finder「打开方式 → OTools」；标签与
+面板并存）：
+
+- 暖状态第二次打开：`otools_consume_open_files → list_archive → 另一 webview consume(空)`
+  ——敲门→consume→本地投递链路打通，不再静默；恰好一次打开。
+- 第三个文件：两次 consume（面板+标签）、一次 `list_archive`——先到先得、无重复。
+- `push_open_file` 全程零调用（退役生效）；URL 兜底 + 启动 consume 被桥内 5s 去重
+  收敛为一次打开（双开向量 3 消失）。
+- 注意：OS 双击到达 OTools 的前提是系统文件关联（宿主设置 → 文件关联 → 绑定 +
+  系统关联注册），否则文件根本不进宿主——这与本修复正交，属于宿主的一次性配置。
+
 ## 6. 留给实现者
 
 - bridge 内去重窗口时长与清刷节奏（初值 5s / 每次投递顺带清理）。
