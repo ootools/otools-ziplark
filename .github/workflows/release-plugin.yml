@@ -1,12 +1,34 @@
 name: release-plugin
+run-name: "Ziplark 插件${{ inputs.dry_run && '验证' || '发布' }} · ${{ inputs.display_version || github.ref_name }}"
+
+# 结构与 otools-zitext / otools-fileshare / otools-releasehub 一致：
+#   meta    → 算版本、标签、发布开关（dry-run 不许写）
+#   build   → 复用 build-plugin.yml（六平台原生编译 + 打包）
+#   release → 建 Release、传资产、按开关提交插件市场
+#
+# 市场开关：
+#   tag 推送         → 看仓变量 OTOOLS_PUBLISH_MARKET（true 才进市场）
+#   workflow_dispatch → 只看输入 publish_market（默认 false，不进市场）
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
+      display_version:
+        description: "打包版本号（留空取 plugin.json）"
+        default: ""
+      auth_mode:
+        description: "市场认证方式"
+        type: choice
+        options: [pat, oidc, login, shared]
+        default: pat
+      publish_market:
+        description: "同步插件市场（dry-run 时仅检查配置，不上架）"
+        type: boolean
+        default: false
       dry_run:
-        description: "只构建校验，不创建 Release"
+        description: "仅构建和校验，不创建 Release、不提交市场"
         type: boolean
         default: true
 
@@ -18,15 +40,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    uses: ./.github/workflows/build-plugin.yml
-
-  release:
-    needs: build
-    if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+  meta:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      packid: ${{ steps.meta.outputs.packid }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      publish_enabled: ${{ steps.meta.outputs.publish_enabled }}
+      market_requested: ${{ steps.meta.outputs.market_requested }}
+      market_enabled: ${{ steps.meta.outputs.market_enabled }}
+      validate_release: ${{ steps.meta.outputs.validate_release }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,38 +57,112 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Verify tag matches plugin.json version
-        if: ${{ github.event_name == 'push' }}
+      - name: 校验版本、标签和发布开关
+        id: meta
         env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          VERSION=$(node -p "require('./plugin.json').version")
-          if [ "$TAG" != "v$VERSION" ]; then
-            echo "tag $TAG does not match plugin.json version v$VERSION" >&2
-            exit 1
-          fi
+          DISPLAY_VERSION: ${{ inputs.display_version }}
+          RELEASE_SOURCE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PUBLISH_MARKET: ${{ inputs.publish_market }}
+          AUTO_PUBLISH_MARKET: ${{ vars.OTOOLS_PUBLISH_MARKET || 'false' }}
+        run: node scripts/publish-market.mjs meta
+
+  build:
+    needs: meta
+    uses: ./.github/workflows/build-plugin.yml
+
+  release:
+    needs: [meta, build]
+    if: ${{ needs.meta.outputs.validate_release == 'true' }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: actions/download-artifact@v4
         with:
           name: plugin-oplg
           path: dist-pack
           run-id: ${{ github.run_id }}
-      - name: Verify every package independently
+      - name: 独立验证每个平台包
         run: node scripts/verify-plugin.mjs dist-pack
-      - name: Create GitHub Release
-        if: ${{ github.event_name == 'push' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Ziplark Archiver ${{ github.ref_name }}
-          body: |
-            OTools 独立插件 `otools-ziplark`。六平台分包（packageMode=1），
-            安装对应平台的 `.oplg` 即可。校验值见 SHA256SUMS。
-          files: |
-            dist-pack/**/*.oplg
-            dist-pack/**/SHA256SUMS
-            dist-pack/**/plugin.json
-            dist-pack/**/logo.svg
-          fail_on_unmatched_files: true
-      - name: Build summary
+      # ⚠️ dist-pack 是「每个平台一个目录」，每份里都有同名的 plugin.json /
+      # logo.svg / SHA256SUMS。直接把 `dist-pack/**/plugin.json` 这类 glob 丢给
+      # 发布动作，会对同名资产反复上传并在更新 metadata 时报 404（实测过）。
+      # 所以先拍平去重，再用显式文件列表上传。
+      - name: 拍平发布资产
         run: |
-          find dist-pack -name '*.oplg' -printf '%f %s bytes\n' | sort >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          mkdir -p release-assets
+          cp dist-pack/*/*.oplg release-assets/
+          cp "$(find dist-pack -name plugin.json | head -n1)" release-assets/plugin.json
+          cp "$(find dist-pack -name logo.svg | head -n1)" release-assets/logo.svg
+          cat dist-pack/*/SHA256SUMS | awk '!seen[$0]++' > release-assets/SHA256SUMS
+          ls -1 release-assets
+      - name: 检查市场凭证配置（不发送凭证、不上架）
+        if: ${{ needs.meta.outputs.market_requested == 'true' }}
+        env:
+          AUTH_MODE: ${{ inputs.auth_mode || vars.XYCLOUD_AUTH_MODE || 'pat' }}
+          XYCLOUD_PAT: ${{ secrets.XYCLOUD_PAT }}
+          XYCLOUD_LOGIN_TOKEN: ${{ secrets.XYCLOUD_LOGIN_TOKEN }}
+          OTOOLS_MARKET_TOKEN: ${{ secrets.OTOOLS_MARKET_TOKEN }}
+          XYCLOUD_OIDC_ISSUER: ${{ vars.XYCLOUD_OIDC_ISSUER }}
+          XYCLOUD_PUBLISHER_ID: ${{ vars.XYCLOUD_PUBLISHER_ID }}
+          OTOOLS_MARKET_API: ${{ vars.OTOOLS_MARKET_API || 'https://otools-api.lingyun.net/api/v1/otools/plugin/publish' }}
+        run: node scripts/publish-market.mjs preflight
+      - name: 核验发布标签与构建提交
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.meta.outputs.release_tag }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: node scripts/release-policy.mjs
+      - name: 发布 GitHub Release
+        if: ${{ needs.meta.outputs.publish_enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.meta.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$COMMIT_SHA" --title "Ziplark Archiver $RELEASE_TAG" \
+              --notes "OTools 独立插件 \`otools-ziplark\` v${RELEASE_VERSION}。六平台分包（packageMode=1），安装对应平台的 \`.oplg\` 即可。校验值见 SHA256SUMS。"
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/*.oplg release-assets/logo.svg \
+            release-assets/plugin.json release-assets/SHA256SUMS --clobber
+      # OIDC 的获取与使用在同一进程完成，凭据不经过 job outputs 或 artifact。
+      - name: 授权并提交市场
+        if: ${{ needs.meta.outputs.market_enabled == 'true' }}
+        env:
+          AUTH_MODE: ${{ inputs.auth_mode || vars.XYCLOUD_AUTH_MODE || 'pat' }}
+          XYCLOUD_PAT: ${{ secrets.XYCLOUD_PAT }}
+          XYCLOUD_LOGIN_TOKEN: ${{ secrets.XYCLOUD_LOGIN_TOKEN }}
+          OTOOLS_MARKET_TOKEN: ${{ secrets.OTOOLS_MARKET_TOKEN }}
+          XYCLOUD_OIDC_ISSUER: ${{ vars.XYCLOUD_OIDC_ISSUER }}
+          XYCLOUD_OIDC_AUDIENCE: ${{ vars.XYCLOUD_OIDC_AUDIENCE || 'otools-ci' }}
+          XYCLOUD_PUBLISHER_ID: ${{ vars.XYCLOUD_PUBLISHER_ID }}
+          OTOOLS_MARKET_API: ${{ vars.OTOOLS_MARKET_API || 'https://otools-api.lingyun.net/api/v1/otools/plugin/publish' }}
+          RELEASE_TAG: ${{ needs.meta.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+          PLUGIN_MANIFEST: release-assets/plugin.json
+          # 与 pack-plugin.mjs 的六平台分包对应：上报 6 个 packageUrl* 并置 packageMode=1。
+          PLATFORM_PACKAGES: "true"
+        run: node scripts/publish-market.mjs
+      - name: 发布摘要
+        env:
+          PUBLISH_ENABLED: ${{ needs.meta.outputs.publish_enabled }}
+          MARKET_ENABLED: ${{ needs.meta.outputs.market_enabled }}
+          RELEASE_TAG: ${{ needs.meta.outputs.release_tag }}
+        run: |
+          find release-assets -name '*.oplg' -printf '%f %s bytes\n' | sort >> "$GITHUB_STEP_SUMMARY"
+          printf '\n### 发布检查完成\n- 正式发布：`%s`\n- 市场提交：`%s`\n- 标签：`%s`\n' "$PUBLISH_ENABLED" "$MARKET_ENABLED" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
