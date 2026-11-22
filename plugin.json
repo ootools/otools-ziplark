@@ -76,5 +76,6 @@
     { "ext": "cbr", "desc": "CBR 漫画归档", "mime": "application/vnd.comicbook-rar" },
     { "ext": "cbt", "desc": "CBT 漫画归档", "mime": "application/x-tar" },
     { "ext": "cb7", "desc": "CB7 漫画归档", "mime": "application/x-7z-compressed" }
-  ]
+  ],
+  "openSourceUrl": "https://github.com/ootools/otools-ziplark"
 }
