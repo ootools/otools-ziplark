@@ -114,7 +114,7 @@ ISO 9660、DEB/AR、RPM/CPIO、PKG/XAR、CAB。
   `workflow_dispatch` 默认 `dry_run=true`，只构建验证、不发 Release。
 
 **tag 必须等于 `v` + `plugin.json.version`**，否则 Release job 会直接失败。
-当前版本只产出 GitHub Release 产物，尚未接入插件市场自动上架；需要上架时手动上传 `.oplg`。
+仓库变量 `OTOOLS_PUBLISH_MARKET=true` 时，版本标签触发六平台 GitHub Release 和插件市场同步发布；市场凭证由 `release` 环境的 `XYCLOUD_PAT` 提供。
 
 ## 许可
 
