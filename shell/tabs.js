@@ -78,6 +78,7 @@
       const normalized = String(path || '').trim();
       if (!normalized) return {tab: null, done: Promise.resolve(false)};
       const tokenBefore = deps.renderToken();
+      const previousActiveId = activeId;
       let tab = null;
       let created = false;
 
@@ -93,7 +94,13 @@
       }
 
       const done = Promise.resolve().then(async () => {
-        if (!opts.keepStack && !created) {
+        if (created) {
+          // 新 tab 必须在 refresh 之前置为激活：上游 openArchive 内部会调用
+          // renderArchive，包装据此把 info 写入 activeId 指向的 tab。若等到
+          // refresh 之后才切换，info 会写进离开页（发后审计 P0）。
+          snapshotActive();
+          activeId = tab.id;
+        } else if (!opts.keepStack) {
           // 重开既有 tab：先把已保存视图还原到页面（刷新在途时页面仍自洽），再刷新
           activateTab(tab.id);
         }
@@ -102,14 +109,15 @@
           // 上游 openArchive 失败时同样 resolve（toast + return）：无渲染即失败
           throw new Error('refresh-produced-no-render');
         }
-        if (!opts.keepStack && created) {
-          activeId = tab.id;
-        }
         snapshotActive();
         return true;
       }).catch(() => {
         if (created) {
           removeTab(tab.id);
+          // 回滚激活态：上游失败也会清空 archiveStack，离开页的栈要还原。
+          activeId = previousActiveId;
+          const previous = byId(previousActiveId);
+          if (previous) deps.state.setArchiveStack((previous.stack || []).slice());
         } else if (tab) {
           // 上游刷新前清空 archiveStack：把 tab 已存栈恢复为权威状态
           deps.state.setArchiveStack((tab.stack || []).slice());
@@ -194,6 +202,7 @@
       const tree = window.__ztState.getTree();
       return {
         expanded: [...tree.expanded],
+        selected: [...(tree.selected || [])],
         sortBy: tree.sortBy,
         sortAsc: tree.sortAsc,
         query: tree.query,
@@ -203,6 +212,7 @@
     setUi: (ui) => {
       const tree = window.__ztState.getTree();
       tree.expanded = new Set(ui.expanded || []);
+      tree.selected = new Set(ui.selected || []);
       tree.sortBy = ui.sortBy || 'name';
       tree.sortAsc = ui.sortAsc !== false;
       tree.query = ui.query || '';
@@ -255,6 +265,10 @@
     }
     return originalCloseArchive();
   };
+  // main.js:1280 在 tabs.js 之前把原 closeArchive 捕获成 btn-close.onclick，
+  // 仅替换 window.closeArchive 不足以让 UI 的关闭按钮走控制器，必须重绑。
+  const btnClose = $('btn-close');
+  if (btnClose) btnClose.onclick = window.closeArchive;
 
   /* ---------- 标签条 ---------- */
 
